@@ -1,27 +1,34 @@
 DEFINE
-    MEASURE _Measures[Ingested (Shared)] =
+    -- records that existed before the CrossRef data starts (Jan 2025)
+    MEASURE _Measures[Records Before 2025] =
         CALCULATE (
             [Ingested Records],
-            TREATAS ( VALUES ( DateTable[Date] ), Companies_Ingestion[Transfer_Date] ),
+            REMOVEFILTERS ( Date_Ingest ),
+            Companies_Ingestion[Transfer_Date] < DATE ( 2025, 1, 1 ),
             TREATAS ( VALUES ( Dim_Country[Country] ), Companies_Ingestion[Country] )
         )
 
-    MEASURE _Measures[Matched (Shared)] =
-        CALCULATE (
-            [Total Matches],
-            TREATAS ( VALUES ( Dim_Country[Country] ), CrossRef_Matches[Country] )
-        )
+    MEASURE _Measures[Total Without Matching] =
+        VAR LastDay = MAX ( DateTable[Date] )
+        RETURN
+            [Records Before 2025]
+                + CALCULATE ( [Ingested (Shared)], REMOVEFILTERS ( DateTable ), DateTable[Date] <= LastDay )
 
-    MEASURE _Measures[Match Rate %] =
-        DIVIDE ( [Matched (Shared)], [Ingested (Shared)] )
+    MEASURE _Measures[Removed by Matching] =
+        VAR LastDay = MAX ( DateTable[Date] )
+        RETURN
+            CALCULATE ( [Matched (Shared)], REMOVEFILTERS ( DateTable ), DateTable[Date] <= LastDay )
 
-    MEASURE _Measures[Net Change] =
-        [Ingested (Shared)] - [Matched (Shared)]
+    MEASURE _Measures[Total After Matching] =
+        [Total Without Matching] - [Removed by Matching]
+
+    MEASURE _Measures[Reduced by Matching %] =
+        DIVIDE ( [Removed by Matching], [Total Without Matching] - [Records Before 2025] )
 
 EVALUATE
     SUMMARIZECOLUMNS (
         DateTable[YearMonth],
-        "Ingested", [Ingested (Shared)],
-        "Matched", [Matched (Shared)],
-        "Rate", [Match Rate %]
+        "Without", [Total Without Matching],
+        "After", [Total After Matching],
+        "Removed", [Removed by Matching]
     )
