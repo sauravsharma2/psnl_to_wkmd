@@ -322,3 +322,113 @@ def build_directid_groups(
         return out
 
     return _finish(rows_state), _finish(rows_city), _finish(rows_no_addr)
+
+
+def build_direct_vs_good(
+    df: pd.DataFrame,
+    *,
+    normalize_text: Callable,
+    excluded_ids: set = None,
+    last_transfer_cutoff: int = 20260401,
+) -> tuple:
+    """
+    Direct-vs-Good: a proposition kept when both sides sit in the same place.
+
+    df is the enriched proposition table — OriginalId from Entries, MatchedId
+    from the company pool, with both sides' parsed address columns.
+
+    The address test is the one the directid sheets use: cities are compared on
+    the normalised, alias-folded, fuzzy-clustered key, and the state decides the
+    bucket. No state is privileged — the two sides simply have to agree.
+
+        same_city_state : both sides carry a state and it is the same
+        same_city       : neither side carries a state
+        (dropped)       : states differ, or only one side has one
+
+    An OriginalId with more than one qualifying MatchedId is ambiguous and is
+    dropped outright. Several OriginalIds may share one MatchedId.
+
+    Returns (same_city_state_df, same_city_df).
+    """
+    empty = pd.DataFrame(columns=OUTPUT_COLUMNS)
+    if df is None or df.empty:
+        return empty.copy(), empty.copy()
+
+    work = df.copy()
+    work["OriginalId"] = work["OriginalId"].astype(str)
+    work["MatchedId"] = work["MatchedId"].astype(str)
+
+    if excluded_ids:
+        before = len(work)
+        work = work[~work["OriginalId"].isin(set(excluded_ids))]
+        print(f"[DVG] {before - len(work):,} rows excluded (claimed earlier)")
+
+    if "LastTransferDate" in work.columns:
+        val = pd.to_numeric(work["LastTransferDate"], errors="coerce")
+        work = work[val >= last_transfer_cutoff]
+        print(f"[DVG] after LastTransferDate >= {last_transfer_cutoff}: {len(work):,} rows")
+
+    for col in ("City1", "City2", "State1", "State2"):
+        if col not in work.columns:
+            work[col] = ""
+    if work.empty:
+        return empty.copy(), empty.copy()
+
+    work["_city1"] = work["City1"].apply(lambda v: _norm_key(v, normalize_text))
+    work["_city2"] = work["City2"].apply(lambda v: _norm_key(v, normalize_text))
+    work["_state1"] = work["State1"].apply(lambda v: _norm_key(v, normalize_text))
+    work["_state2"] = work["State2"].apply(lambda v: _norm_key(v, normalize_text))
+
+    # Fold misspellings across both sides at once so "DEVNER"/"DENVER" meet.
+    _keys = pd.concat([work["_city1"], work["_city2"]])
+    _freq = _keys.value_counts().to_dict()
+    _canon = _city_cluster_keys(sorted(k for k in _keys.unique() if k), counts=_freq)
+    _folded = sum(1 for k, v in _canon.items() if k != v)
+    if _folded:
+        print(f"[DVG] {_folded} city spelling(s) folded onto a canonical form")
+    work["_city1"] = work["_city1"].map(lambda k: _canon.get(k, k))
+    work["_city2"] = work["_city2"].map(lambda k: _canon.get(k, k))
+
+    work = work[(work["_city1"] != "") & (work["_city1"] == work["_city2"])]
+    if work.empty:
+        return empty.copy(), empty.copy()
+
+    both_state = (work["_state1"] != "") & (work["_state2"] != "")
+    no_state = (work["_state1"] == "") & (work["_state2"] == "")
+    state_rows = work[both_state & (work["_state1"] == work["_state2"])]
+    city_rows = work[no_state]
+
+    def _finish(sub):
+        if sub.empty:
+            return empty.copy()
+        # One MatchedId per OriginalId; an id proposing several is ambiguous.
+        counts = sub.groupby("OriginalId")["MatchedId"].nunique()
+        keep = set(counts[counts == 1].index)
+        dropped = len(counts) - len(keep)
+        if dropped:
+            print(f"[DVG] {dropped:,} OriginalId(s) dropped — several qualifying MatchedIds")
+        sub = sub[sub["OriginalId"].isin(keep)]
+        if sub.empty:
+            return empty.copy()
+
+        sizes = sub.groupby("MatchedId")["OriginalId"].nunique()
+        out = pd.DataFrame({
+            "OriginalId": sub["OriginalId"],
+            "Name": sub.get("Name"),
+            "NameNormalized": sub.get("NameNormalized"),
+            "MatchedId": sub["MatchedId"],
+            "MatchedName": sub.get("MatchedName"),
+            "NameScore": sub.get("NameScore"),
+            "Street1": sub.get("Street1"), "City1": sub.get("City1"),
+            "State1": sub.get("State1"), "PostalCode1": sub.get("PostalCode1"),
+            "Street2": sub.get("Street2"), "City2": sub.get("City2"),
+            "State2": sub.get("State2"), "PostalCode2": sub.get("PostalCode2"),
+            "NrLinks 1": sub.get("NrLinks 1"), "NrLinks 2": sub.get("NrLinks 2"),
+            "GroupSize": sub["MatchedId"].map(sizes),
+            "OwnershipLink": "",
+        })
+        return out.sort_values(
+            ["MatchedId", "OriginalId"], kind="stable"
+        ).reset_index(drop=True)
+
+    return _finish(state_rows), _finish(city_rows)
