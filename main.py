@@ -905,6 +905,12 @@ def run() -> tuple[int, dict]:
     except Exception as e:
         print(f"[ISOLATED][ERROR] isolated-id self-matching step failed, skipping: {e}")
 
+    # A run with no matches at all leaves a column-less frame; give it the
+    # schema the rest of the pipeline indexes into.
+    for _col in ("OriginalId", "Name", "MatchedId", "MatchedName"):
+        if _col not in matched_df_raw.columns:
+            matched_df_raw[_col] = pd.Series(dtype=object)
+
     matched_df_raw = matched_df_raw[matched_df_raw["OriginalId"] != matched_df_raw["MatchedId"]]
 
     matched_df_raw["_min_id"] = np.where(
@@ -1831,6 +1837,3 @@ if __name__ == "__main__":
         print(f"[TIMER] Total: {elapsed_s / 60:.2f} min ({elapsed_s:.1f} s)")
 
         sys.exit(exit_code)
-
-
-
