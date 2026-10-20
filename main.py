@@ -28,7 +28,7 @@ from src.code.delaware_output import (
     split_direct_linked,
     stamp_ownership,
 )
-from src.code.directid_grouping import build_directid_groups
+from src.code.directid_grouping import build_direct_vs_good, build_directid_groups
 from src.db_connexion.data_extraction import load_query, connect_db
 from utils.config import PROJECT_NAME
 
@@ -1522,18 +1522,17 @@ def run() -> tuple[int, dict]:
         # frame is reused by step 4, which groups the address-less ids later in
         # the cascade.
         try:
-            # Only the OriginalId side of Delaware_Single_Match is out of scope.
-            # Its MatchedIds stay available: they are Entries ids too and may
-            # legitimately anchor or join a group here.
-            de_handled = set(_de_original_ids)
+            # Both sides of Delaware_Single_Match are out of scope, here and in
+            # every later step: a pool id is never treated as an OriginalId.
+            de_handled = set(_de_ids_both_sides)
 
             all_ids = [
                 i for i in df_cases["OriginalId"].astype(str).unique().tolist()
                 if i not in de_handled
             ]
             print(
-                f"[STEP2] {len(de_handled):,} ids excluded (Delaware_Single_Match "
-                f"OriginalId) — {len(all_ids):,} ids to consider"
+                f"[STEP2] {len(de_handled):,} ids excluded (Delaware_Single_Match, "
+                f"both sides) — {len(all_ids):,} ids to consider"
             )
             cities_all = _fetch_cities(all_ids)
 
@@ -1598,65 +1597,86 @@ def run() -> tuple[int, dict]:
         _BOTH = ("OriginalId", "MatchedId")
         _step2_frames = (same_city_state_df, same_city_df)
 
-        # --- Step 3: several OriginalIds sharing one Delaware MatchedId ------
-        # Only the OriginalId side of steps 1 and 2 is out of scope. The
-        # MatchedIds step 2 produced are Entries ids and may appear here on the
-        # OriginalId side.
+        # --- Step 3: direct-vs-good, both sides in the same place ------------
+        # The propositions themselves, filtered on the step 2 address test. No
+        # state is privileged; the two sides only have to agree.
         try:
-            _step3_excluded = _de_original_ids | _ids_of(_step2_frames)
+            dvg_state_df, dvg_city_df = build_direct_vs_good(
+                enriched_snapshot_df,
+                normalize_text=normalize_text,
+                excluded_ids=_de_ids_both_sides | _ids_of(_step2_frames),
+                last_transfer_cutoff=LAST_TRANSFER_CUTOFF,
+            )
+            print(
+                f"[STEP3] direct_vs_good_same_city_state={len(dvg_state_df)} | "
+                f"direct_vs_good_same_city={len(dvg_city_df)}"
+            )
+        except Exception as e:
+            print(f"[STEP3][ERROR] direct-vs-good failed: {e}")
+            dvg_state_df = pd.DataFrame()
+            dvg_city_df = pd.DataFrame()
+
+        _step3_frames = (dvg_state_df, dvg_city_df)
+
+        # --- Step 4: several OriginalIds sharing one Delaware MatchedId ------
+        try:
+            _step4_sel_excluded = (
+                _de_ids_both_sides | _ids_of(_step2_frames) | _ids_of(_step3_frames)
+            )
             p3_selection = select_multiple_directid(
                 enriched_snapshot_df,
-                excluded_ids=_step3_excluded,
+                excluded_ids=_step4_sel_excluded,
                 agent_addresses=AGENT_ADDRESSES,
                 normalize_text=normalize_text,
                 normalize_name=normalize_name,
                 relations=("same_legal",),
                 delaware="require",
                 last_transfer_cutoff=LAST_TRANSFER_CUTOFF,
-                label="STEP3",
+                label="STEP4",
             )
         except Exception as e:
-            print(f"[STEP3][ERROR] selection failed: {e}")
+            print(f"[STEP4][ERROR] selection failed: {e}")
             p3_selection = pd.DataFrame()
 
-        # --- Step 4: the address-less grouping bucket ------------------------
-        # Runs after step 3 so an id whose proposition belongs to a shared
-        # Delaware cluster is not claimed here on the strength of its name
-        # alone. Both sides of steps 1-3 are out of scope.
+        # --- Step 5: the address-less grouping bucket ------------------------
+        # Runs late so an id whose proposition belongs to a shared Delaware
+        # cluster is not claimed here on the strength of its name alone.
         try:
-            _step4_excluded = (
+            _step5_excluded = (
                 _de_ids_both_sides
                 | _ids_of(_step2_frames, _BOTH)
+                | _ids_of(_step3_frames, _BOTH)
                 | _ids_of((p3_selection,), _BOTH)
             )
             _, _, no_address_df = build_directid_groups(
                 base,
                 normalize_name=normalize_name,
                 normalize_text=normalize_text,
-                excluded_ids=_step4_excluded,
+                excluded_ids=_step5_excluded,
                 buckets=("no_address",),
             )
-            print(f"[STEP4] directid_no_address={len(no_address_df)}")
+            print(f"[STEP5] directid_no_address={len(no_address_df)}")
         except Exception as e:
-            print(f"[STEP4][ERROR] address-less grouping failed: {e}")
+            print(f"[STEP5][ERROR] address-less grouping failed: {e}")
             no_address_df = pd.DataFrame()
 
-        # --- Step 5: the remaining shared-target sheets ----------------------
-        # Same shape as step 3, narrowing by legal form and dropping the
+        # --- Step 6: the remaining shared-target sheets ----------------------
+        # Same shape as step 4, narrowing by legal form and dropping the
         # Delaware requirement. Each pass skips what the previous ones took, so
         # an id lands in one sheet only.
         try:
             _handled = (
-                _de_original_ids
+                _de_ids_both_sides
                 | _ids_of(_step2_frames)
+                | _ids_of(_step3_frames)
                 | _ids_of((p3_selection,), _BOTH)
                 | _ids_of((no_address_df,))
             )
 
             _passes = [
-                ("p3_same_legal", ("same_legal",), "exclude", "STEP5-SAMELEGAL"),
-                ("p3_diff_legal", ("diff_legal",), "ignore", "STEP5-DIFFLEGAL"),
-                ("p3_no_legal", ("a_no_legal",), "ignore", "STEP5-NOLEGAL"),
+                ("p3_same_legal", ("same_legal",), "exclude", "STEP6-SAMELEGAL"),
+                ("p3_diff_legal", ("diff_legal",), "ignore", "STEP6-DIFFLEGAL"),
+                ("p3_no_legal", ("a_no_legal",), "ignore", "STEP6-NOLEGAL"),
             ]
             _p3_frames = {}
             for key, rels, de_mode, tag in _passes:
@@ -1679,7 +1699,7 @@ def run() -> tuple[int, dict]:
             p3_diff_legal_sel = _p3_frames["p3_diff_legal"]
             p3_no_legal_sel = _p3_frames["p3_no_legal"]
         except Exception as e:
-            print(f"[STEP5][ERROR] selection failed: {e}")
+            print(f"[STEP6][ERROR] selection failed: {e}")
             p3_same_legal_sel = pd.DataFrame()
             p3_diff_legal_sel = pd.DataFrame()
             p3_no_legal_sel = pd.DataFrame()
@@ -1691,7 +1711,8 @@ def run() -> tuple[int, dict]:
             _own_ids = set()
             for _df in (de_selection, p3_selection, p3_same_legal_sel,
                         p3_diff_legal_sel, p3_no_legal_sel,
-                        same_city_state_df, same_city_df, no_address_df):
+                        same_city_state_df, same_city_df, no_address_df,
+                        dvg_state_df, dvg_city_df):
                 if _df is None or _df.empty:
                     continue
                 for _col in ("OriginalId", "MatchedId"):
@@ -1720,6 +1741,8 @@ def run() -> tuple[int, dict]:
             same_city_state_df = stamp_ownership(same_city_state_df, _ownership)
             same_city_df = stamp_ownership(same_city_df, _ownership)
             no_address_df = stamp_ownership(no_address_df, _ownership)
+            dvg_state_df = stamp_ownership(dvg_state_df, _ownership)
+            dvg_city_df = stamp_ownership(dvg_city_df, _ownership)
             direct_linked_df = stamp_ownership(direct_linked_df, _ownership)
         except Exception as e:
             print(f"[OWNERSHIP][ERROR] ownership pass failed: {e}")
@@ -1764,6 +1787,14 @@ def run() -> tuple[int, dict]:
             if not same_city_df.empty:
                 write_df_split(same_city_df, de_writer, "directid_Same_city")
                 wrote_any = True
+
+            for _frame, _sheet in (
+                (dvg_state_df, "direct_vs_good_same_city_state"),
+                (dvg_city_df, "direct_vs_good_same_city"),
+            ):
+                if _frame is not None and not _frame.empty:
+                    write_df_split(_frame, de_writer, _sheet)
+                    wrote_any = True
 
             if not no_address_df.empty:
                 write_df_split(no_address_df, de_writer, "directid_no_address")
