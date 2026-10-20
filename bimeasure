@@ -1,0 +1,27 @@
+DEFINE
+    MEASURE _Measures[Ingested (Shared)] =
+        CALCULATE (
+            [Ingested Records],
+            TREATAS ( VALUES ( DateTable[Date] ), Companies_Ingestion[Transfer_Date] ),
+            TREATAS ( VALUES ( Dim_Country[Country] ), Companies_Ingestion[Country] )
+        )
+
+    MEASURE _Measures[Matched (Shared)] =
+        CALCULATE (
+            [Total Matches],
+            TREATAS ( VALUES ( Dim_Country[Country] ), CrossRef_Matches[Country] )
+        )
+
+    MEASURE _Measures[Match Rate %] =
+        DIVIDE ( [Matched (Shared)], [Ingested (Shared)] )
+
+    MEASURE _Measures[Net Change] =
+        [Ingested (Shared)] - [Matched (Shared)]
+
+EVALUATE
+    SUMMARIZECOLUMNS (
+        DateTable[YearMonth],
+        "Ingested", [Ingested (Shared)],
+        "Matched", [Matched (Shared)],
+        "Rate", [Match Rate %]
+    )
