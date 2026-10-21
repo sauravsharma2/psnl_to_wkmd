@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""
+fix_direct_vs_good.py — apply the same-name/same-legal-form rule to the
+direct_vs_good sheets of an existing matches_delaware.xlsx.
+
+Why this exists
+---------------
+The two direct_vs_good sheets were produced without the name rule every other
+sheet applies: both sides must carry the same legal form, and the word parts
+must clear the usual threshold. The rows are therefore too permissive —
+"ABC HOLDINGS LLC" paired with "ABC HOLDINGS INC" would have been kept.
+
+Everything needed to apply the rule is already in the workbook: each row holds
+Name and MatchedName. Re-running main.py would take 8-10 hours; this takes
+minutes and needs no database.
+
+What it does
+------------
+    1. Read every sheet from the workbook
+    2. For the two direct_vs_good sheets, run name_relation over each row,
+       keep only same_legal, and fill in the NameScore column
+    3. Recompute GroupSize, since dropping rows changes how many OriginalIds
+       are left on a MatchedId
+    4. Write a new workbook with every other sheet copied unchanged
+
+Limitation
+----------
+The OriginalIds dropped here were excluded from the later sheets when the run
+was made. A full run would reconsider them for multiple_directid_delaware,
+directid_no_address and the legal-form sheets; this script cannot, so those
+sheets stay as they are and may be missing a few rows. The direct_vs_good
+sheets themselves come out correct.
+
+Usage
+-----
+    python fix_direct_vs_good.py
+    python fix_direct_vs_good.py output/matches_delaware.xlsx
+    python fix_direct_vs_good.py in.xlsx out.xlsx
+"""
+
+from __future__ import annotations
+
+import re
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+
+from src.code.name_matching import name_relation
+
+
+DEFAULT_INPUT = Path("output/matches_delaware.xlsx")
+DEFAULT_OUTPUT = Path("output/matches_delaware_dvg_fixed.xlsx")
+
+SHEET_STATE = "direct_vs_good_same_city_state"
+SHEET_CITY = "direct_vs_good_same_city"
+DVG_SHEETS = (SHEET_STATE, SHEET_CITY)
+
+
+def normalize_name(name) -> str:
+    """Byte-for-byte the normalize_name() used inside main.py's run()."""
+    if pd.isna(name):
+        return ""
+    name_lower = str(name).lower()
+    name_no_parens = re.sub(r"[()]", "", name_lower)
+    name_no_and = re.sub(r"\band\b", "", name_no_parens)
+    name_no_and = re.sub(r"-", " ", name_no_and)
+    name_clean = re.sub(r"[^\w\s]", "", name_no_and)
+    return re.sub(r"\s+", " ", name_clean).strip()
+
+
+def filter_sheet(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """Keep the same_legal rows, fill NameScore, recompute GroupSize."""
+    if df is None or df.empty:
+        return df
+
+    if "Name" not in df.columns or "MatchedName" not in df.columns:
+        print(f"[{label}] no Name/MatchedName columns — left untouched")
+        return df
+
+    out = df.copy()
+    norm_orig = out["Name"].fillna("").astype(str).apply(normalize_name)
+    norm_match = out["MatchedName"].fillna("").astype(str).apply(normalize_name)
+    results = [name_relation(a, b) for a, b in zip(norm_orig, norm_match)]
+
+    out["NameScore"] = [r[1] for r in results]
+    keep = [r[0] == "same_legal" for r in results]
+
+    dropped = len(out) - sum(keep)
+    breakdown = pd.Series([r[0] for r in results]).value_counts().to_dict()
+    print(f"[{label}] {len(out):,} rows -> {sum(keep):,} kept, {dropped:,} dropped")
+    print(f"[{label}] relations: " + ", ".join(f"{k}={v:,}" for k, v in breakdown.items()))
+
+    out = out[keep]
+    if out.empty:
+        return out
+
+    if "GroupSize" in out.columns and "MatchedId" in out.columns:
+        sizes = out.groupby("MatchedId")["OriginalId"].nunique()
+        out["GroupSize"] = out["MatchedId"].map(sizes)
+
+    return out.reset_index(drop=True)
+
+
+def main(argv) -> int:
+    in_path = Path(argv[1]) if len(argv) > 1 else DEFAULT_INPUT
+    out_path = Path(argv[2]) if len(argv) > 2 else DEFAULT_OUTPUT
+
+    if not in_path.exists():
+        print(f"[ERROR] not found: {in_path}")
+        return 1
+
+    t0 = time.time()
+    print(f"[READ] {in_path}")
+    sheets = pd.read_excel(in_path, sheet_name=None, dtype=object)
+    print(f"[READ] {len(sheets)} sheets in {time.time() - t0:.1f}s")
+
+    targets = [s for s in sheets if s in DVG_SHEETS]
+    if not targets:
+        print(f"[ERROR] neither {SHEET_STATE} nor {SHEET_CITY} is in this workbook")
+        return 1
+
+    for name in targets:
+        sheets[name] = filter_sheet(sheets[name], name)
+
+    print(f"[WRITE] {out_path}")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+        for name, df in sheets.items():
+            if df is None:
+                continue
+            if df.empty:
+                print(f"[WRITE] {name}: empty, skipped")
+                continue
+            df.to_excel(writer, sheet_name=name[:31], index=False)
+
+    print(f"[DONE] {time.time() - t0:.1f}s")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
