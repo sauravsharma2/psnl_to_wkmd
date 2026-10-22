@@ -1,4 +1,22 @@
+"""
+Databrick_YY_SQL_Check — checks Databricks YY UniqueMatch results against SQL Server (bvdaffils).
 
+Input : matches_YY_<date>.xlsx (sheet UniqueMatch)      unique winners, from Databricks
+        matches_multi_YY_<date>.csv                          tie rows (Multi_INC_review / CN_Multi_INC_review)
+        Pass the xlsx path, or leave it out to use the newest matches_YY_*.xlsx next to this script;
+        the multi CSV with the same date is picked up automatically (skipped with a warning if missing).
+Output: output/sql_check_YY_<input date>.xlsx        unique winners: UniqueMatch (all) + INC / No_INC / CN_* sheets
+        output/sql_check_multi_YY_<input date>.xlsx  ties: Multi_INC_review / CN_Multi_INC_review
+                                                     (a sheet over 1,048,000 rows is split: _2, _3 ...)
+        Every UniqueMatch column + these new columns:
+          OLD_bvdlien, NEW_bvdlien  BvD ID -> BvDLiens ID (bvdaffils.dbo.GetBvDLiensID)
+          InSQL                     yes / no / no_liens_id  (is the MatchedId in Companies?)
+          Foreign                   foreign / not_foreign   (Companies.[Foreign] in 1, 2)
+          SQL_shared_link           rows with 'no ownership link' only: shared links found in SQL Server,
+                                    e.g. shared_subsidiary_obo|shared_UO_obo
+
+SQL lives in queries/ (01 … 05). Run:  python main.py [matches_YY_20261006.xlsx]
+"""
 import argparse
 import re
 import sys
@@ -33,8 +51,21 @@ SHEET_ORDER = ["INC", "No_INC", "CN_INC_Same_Native", "CN_No_INC_Same_Native",
 MULTI_SHEETS = ["Multi_INC_review", "CN_Multi_INC_review"]
 
 
-def write_sheets(df: pd.DataFrame, out: Path, order: list[str] = SHEET_ORDER, all_name: str = "UniqueMatch") -> None:
-    """First sheet = every row; then one sheet per name in `order` (empty sheets are still written)."""
+MAX_SHEET_ROWS = 1_048_000          # Excel limit is 1,048,576 rows per sheet
+
+
+def _to_sheets(xw, df: pd.DataFrame, name: str) -> None:
+    """Write df to one sheet, or to name, name_2, name_3 ... when it is over the Excel row limit."""
+    if df.empty:
+        df.to_excel(xw, sheet_name=name[:31], index=False)
+        return
+    for k, i in enumerate(range(0, len(df), MAX_SHEET_ROWS), start=1):
+        sheet = name if k == 1 else f"{name[:28]}_{k}"
+        df.iloc[i:i + MAX_SHEET_ROWS].to_excel(xw, sheet_name=sheet[:31], index=False)
+
+
+def write_sheets(df: pd.DataFrame, out: Path, order: list[str], all_name: str | None = None) -> None:
+    """Optional first sheet with every row; then one sheet per name in `order` (empty sheets still written)."""
     t = time.time()
     try:
         import xlsxwriter  # noqa: F401  (much faster than openpyxl for big sheets)
@@ -42,13 +73,11 @@ def write_sheets(df: pd.DataFrame, out: Path, order: list[str] = SHEET_ORDER, al
     except ImportError:
         engine = "openpyxl"
     with pd.ExcelWriter(out, engine=engine) as xw:
-        df.to_excel(xw, sheet_name=all_name, index=False)
-        if "ResultSheet" not in df.columns:
-            print(f"[warn] no ResultSheet column in input — only {all_name} written")
-        else:
-            for name in order:
-                df[df["ResultSheet"] == name].to_excel(xw, sheet_name=name[:31], index=False)
-    print(f"[xlsx] {out.name} written in {time.time() - t:.0f}s")
+        if all_name:
+            _to_sheets(xw, df, all_name)
+        for name in order:
+            _to_sheets(xw, df[df["ResultSheet"] == name], name)
+    print(f"[xlsx] {out.name}: {len(df):,} rows written in {time.time() - t:.0f}s")
 
 
 def find_input(arg: str | None) -> Path:
@@ -63,6 +92,13 @@ def find_input(arg: str | None) -> Path:
     return files[-1]
 
 
+def _check_cols(df: pd.DataFrame, src: str) -> pd.DataFrame:
+    for col in ("OriginalId", "MatchedId", "ownership_link", "ResultSheet"):
+        if col not in df.columns:
+            sys.exit(f"Column '{col}' not in {src}. Found: {list(df.columns)}")
+    return df
+
+
 def load(path: Path) -> pd.DataFrame:
     t = time.time()
     try:  # calamine reads big xlsx ~10x faster; falls back to openpyxl if not installed
@@ -70,10 +106,19 @@ def load(path: Path) -> pd.DataFrame:
     except Exception:
         df = pd.read_excel(path, sheet_name=SHEET, dtype=str)
     print(f"[read] {len(df):,} rows from {path.name} / {SHEET} in {time.time() - t:.0f}s")
-    for col in ("OriginalId", "MatchedId", "ownership_link"):
-        if col not in df.columns:
-            sys.exit(f"Column '{col}' not in sheet '{SHEET}'. Found: {list(df.columns)}")
-    return df
+    return _check_cols(df, f"{path.name} / {SHEET}")
+
+
+def load_multi(xlsx: Path) -> pd.DataFrame | None:
+    """matches_multi_YY_<date>.csv next to the unique xlsx (same date)."""
+    path = xlsx.with_name(xlsx.stem.replace("matches_", "matches_multi_", 1) + ".csv")
+    if not path.exists():
+        print(f"[warn] {path.name} not found — multi file skipped")
+        return None
+    t = time.time()
+    df = pd.read_csv(path, dtype=str, keep_default_na=False, na_values=[""], encoding="utf-8")
+    print(f"[read] {len(df):,} rows from {path.name} in {time.time() - t:.0f}s")
+    return _check_cols(df, path.name)
 
 
 def insert(cur, table: str, cols: str, rows: list[tuple]) -> None:
@@ -127,7 +172,10 @@ def main() -> int:
     args = ap.parse_args()
 
     path = find_input(args.xlsx)
-    df = load(path)
+    uniq = load(path)
+    multi = load_multi(path)
+    df = pd.concat([uniq, multi], ignore_index=True) if multi is not None else uniq
+    is_multi = df["ResultSheet"].isin(MULTI_SHEETS)
 
     clean = lambda s: s.fillna("").str.strip().str.replace("!", "", regex=False)  # same as MatchingOK
     old_ids, new_ids = clean(df["OriginalId"]), clean(df["MatchedId"])
@@ -152,9 +200,11 @@ def main() -> int:
     tag = re.search(r"(YY_\d{8})", path.name)
     out = OUTDIR / f"sql_check_{tag.group(1) if tag else 'YY'}.xlsx"
     out_multi = OUTDIR / f"sql_check_multi_{tag.group(1) if tag else 'YY'}.xlsx"
-    is_multi = df["ResultSheet"].isin(MULTI_SHEETS) if "ResultSheet" in df.columns else pd.Series(False, index=df.index)
-    write_sheets(df[~is_multi], out)
-    write_sheets(df[is_multi], out_multi, order=MULTI_SHEETS, all_name="MultiMatch")
+    write_sheets(df[~is_multi], out, order=SHEET_ORDER, all_name="UniqueMatch")
+    artifacts = [(str(out), "table", "xlsx", True)]
+    if multi is not None:
+        write_sheets(df[is_multi], out_multi, order=MULTI_SHEETS)
+        artifacts.append((str(out_multi), "table", "xlsx", True))
 
     metrics = {
         "rows": len(df),
@@ -164,15 +214,15 @@ def main() -> int:
         "foreign": df["Foreign"].value_counts().to_dict(),
         "no_link_rows": int(no_link.sum()),
         "no_link_rows_with_sql_link": int((df["SQL_shared_link"] != "").sum()),
-        "sheets": df["ResultSheet"].value_counts().to_dict() if "ResultSheet" in df.columns else {},
+        "multi_yy_ids": int(df.loc[is_multi, "OriginalId"].nunique()),
+        "sheets": df["ResultSheet"].value_counts().to_dict(),
     }
-    print(f"\n[done] {out}\n       {out_multi}")
+    print(f"\n[done] {out}" + (f"\n       {out_multi}" if multi is not None else ""))
     for k, v in metrics.items():
         print(f"  {k}: {v}")
 
     return finalize_run(project_name=PROJECT_NAME, started_at=started,
-                        extra_artifacts=[(str(out), "table", "xlsx", True),
-                                         (str(out_multi), "table", "xlsx", True)], metrics=metrics)
+                        extra_artifacts=artifacts, metrics=metrics)
 
 
 if __name__ == "__main__":
