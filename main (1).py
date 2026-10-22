@@ -1,18 +1,4 @@
-"""
-Databrick_YY_SQL_Check — checks Databricks YY UniqueMatch results against SQL Server (bvdaffils).
 
-Input : matches_YY_<date>.xlsx (sheet UniqueMatch, with a ResultSheet column) from Databricks.
-        Pass the path, or leave it out to use the newest matches_YY_*.xlsx next to this script.
-Output: output/sql_check_YY_<input date>.xlsx, one sheet per ResultSheet value + UniqueMatch (all rows).
-        Every UniqueMatch column + these new columns:
-          OLD_bvdlien, NEW_bvdlien  BvD ID -> BvDLiens ID (bvdaffils.dbo.GetBvDLiensID)
-          InSQL                     yes / no / no_liens_id  (is the MatchedId in Companies?)
-          Foreign                   foreign / not_foreign   (Companies.[Foreign] in 1, 2)
-          SQL_shared_link           rows with 'no ownership link' only: shared links found in SQL Server,
-                                    e.g. shared_subsidiary_obo|shared_UO_obo
-
-SQL lives in queries/ (01 … 05). Run:  python main.py [matches_YY_20261006.xlsx]
-"""
 import argparse
 import re
 import sys
@@ -43,12 +29,12 @@ def q(name: str) -> str:
 
 
 SHEET_ORDER = ["INC", "No_INC", "CN_INC_Same_Native", "CN_No_INC_Same_Native",
-               "CN_INC_No_Native", "CN_No_INC_No_Native",
-               "Multi_INC_review", "CN_Multi_INC_review"]
+               "CN_INC_No_Native", "CN_No_INC_No_Native"]
+MULTI_SHEETS = ["Multi_INC_review", "CN_Multi_INC_review"]
 
 
-def write_sheets(df: pd.DataFrame, out: Path) -> None:
-    """UniqueMatch = every row; then one sheet per ResultSheet value (empty sheets are still written)."""
+def write_sheets(df: pd.DataFrame, out: Path, order: list[str] = SHEET_ORDER, all_name: str = "UniqueMatch") -> None:
+    """First sheet = every row; then one sheet per name in `order` (empty sheets are still written)."""
     t = time.time()
     try:
         import xlsxwriter  # noqa: F401  (much faster than openpyxl for big sheets)
@@ -56,11 +42,11 @@ def write_sheets(df: pd.DataFrame, out: Path) -> None:
     except ImportError:
         engine = "openpyxl"
     with pd.ExcelWriter(out, engine=engine) as xw:
-        df.to_excel(xw, sheet_name="UniqueMatch", index=False)
+        df.to_excel(xw, sheet_name=all_name, index=False)
         if "ResultSheet" not in df.columns:
-            print("[warn] no ResultSheet column in input — only UniqueMatch written")
+            print(f"[warn] no ResultSheet column in input — only {all_name} written")
         else:
-            for name in SHEET_ORDER + sorted(set(df["ResultSheet"].dropna()) - set(SHEET_ORDER)):
+            for name in order:
                 df[df["ResultSheet"] == name].to_excel(xw, sheet_name=name[:31], index=False)
     print(f"[xlsx] {out.name} written in {time.time() - t:.0f}s")
 
@@ -165,22 +151,28 @@ def main() -> int:
     OUTDIR.mkdir(exist_ok=True)
     tag = re.search(r"(YY_\d{8})", path.name)
     out = OUTDIR / f"sql_check_{tag.group(1) if tag else 'YY'}.xlsx"
-    write_sheets(df, out)
+    out_multi = OUTDIR / f"sql_check_multi_{tag.group(1) if tag else 'YY'}.xlsx"
+    is_multi = df["ResultSheet"].isin(MULTI_SHEETS) if "ResultSheet" in df.columns else pd.Series(False, index=df.index)
+    write_sheets(df[~is_multi], out)
+    write_sheets(df[is_multi], out_multi, order=MULTI_SHEETS, all_name="MultiMatch")
 
     metrics = {
         "rows": len(df),
+        "unique_rows": int((~is_multi).sum()),
+        "multi_rows": int(is_multi.sum()),
         "in_sql": df["InSQL"].value_counts().to_dict(),
         "foreign": df["Foreign"].value_counts().to_dict(),
         "no_link_rows": int(no_link.sum()),
         "no_link_rows_with_sql_link": int((df["SQL_shared_link"] != "").sum()),
         "sheets": df["ResultSheet"].value_counts().to_dict() if "ResultSheet" in df.columns else {},
     }
-    print(f"\n[done] {out}")
+    print(f"\n[done] {out}\n       {out_multi}")
     for k, v in metrics.items():
         print(f"  {k}: {v}")
 
     return finalize_run(project_name=PROJECT_NAME, started_at=started,
-                        extra_artifacts=[(str(out), "table", "xlsx", True)], metrics=metrics)
+                        extra_artifacts=[(str(out), "table", "xlsx", True),
+                                         (str(out_multi), "table", "xlsx", True)], metrics=metrics)
 
 
 if __name__ == "__main__":
