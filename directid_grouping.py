@@ -56,7 +56,7 @@ import pandas as pd
 
 from src.code.name_matching import (
     NAME_FUZZY_THRESHOLD, _threshold_for, cluster_by_similarity, cluster_names,
-    name_score, split_name,
+    name_relation, name_score, split_name,
 )
 
 try:
@@ -328,6 +328,7 @@ def build_direct_vs_good(
     df: pd.DataFrame,
     *,
     normalize_text: Callable,
+    normalize_name: Callable,
     excluded_ids: set = None,
     last_transfer_cutoff: int = 20260401,
 ) -> tuple:
@@ -336,6 +337,9 @@ def build_direct_vs_good(
 
     df is the enriched proposition table — OriginalId from Entries, MatchedId
     from the company pool, with both sides' parsed address columns.
+
+    The name rule is the one every other sheet applies: both sides must carry
+    the same legal form and the word parts must clear the usual threshold.
 
     The address test is the one the directid sheets use: cities are compared on
     the normalised, alias-folded, fuzzy-clustered key, and the state decides the
@@ -367,6 +371,14 @@ def build_direct_vs_good(
         val = pd.to_numeric(work["LastTransferDate"], errors="coerce")
         work = work[val >= last_transfer_cutoff]
         print(f"[DVG] after LastTransferDate >= {last_transfer_cutoff}: {len(work):,} rows")
+
+    if not work.empty and "MatchedName" in work.columns:
+        norm_orig = work["Name"].fillna("").astype(str).apply(normalize_name)
+        norm_match = work["MatchedName"].fillna("").astype(str).apply(normalize_name)
+        results = [name_relation(a, b) for a, b in zip(norm_orig, norm_match)]
+        work["NameScore"] = [r[1] for r in results]
+        work = work[[r[0] == "same_legal" for r in results]]
+        print(f"[DVG] after name rule (same name, same legal form): {len(work):,} rows")
 
     for col in ("City1", "City2", "State1", "State2"):
         if col not in work.columns:
