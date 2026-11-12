@@ -35,3 +35,16 @@ SWITCH ( [Grain Sel],
     0, [Snap Total W],
     1, [Snap Total M (Provisional)]
 )
+
+
+-----------
+
+Total Records (Latest) =
+VAR LastW = MAX ( Snap_W[SnapshotDate] )
+VAR LastM = MAX ( Snap_M[SnapshotDate] )
+RETURN
+    IF (
+        LastW >= LastM || ISBLANK ( LastM ),
+        CALCULATE ( SUM ( Snap_W[Records] ), Snap_W[SnapshotDate] = LastW ),
+        CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = LastM )
+    )
