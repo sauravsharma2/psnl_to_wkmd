@@ -1,50 +1,14 @@
-Snap Total M (Provisional) =
-VAR MonthStart = MIN ( Date_Ingest[Date] )
-VAR MonthEnd   = MAX ( Date_Ingest[Date] )
-VAR MonthSnap  = [Snap Total M]
-VAR LastMSnap  = CALCULATE ( MAX ( Snap_M[SnapshotDate] ), ALL ( Snap_M ) )
-VAR LastWInPeriod =
-    CALCULATE (
-        MAX ( Snap_W[SnapshotDate] ),
-        ALL ( Date_Ingest ),
-        Snap_W[SnapshotDate] >= MonthStart,
-        Snap_W[SnapshotDate] <= MonthEnd
-    )
-RETURN
-    IF (
-        NOT ISBLANK ( MonthSnap ),
-        MonthSnap,                                        -- monthly snapshot hai: wahi lo
-        IF (
-            MonthStart > LastMSnap && NOT ISBLANK ( LastWInPeriod ),
-            CALCULATE (                                   -- warna us mahine ka latest weekly lo
-                SUM ( Snap_W[Records] ),
-                ALL ( Date_Ingest ),
-                Snap_W[SnapshotDate] = LastWInPeriod
-            )
-        )
-    )
-
-
-
-
----------
-
-
-Snap Total Sel =
-SWITCH ( [Grain Sel],
-    0, [Snap Total W],
-    1, [Snap Total M (Provisional)]
-)
-
-
------------
-
-Total Records (Latest) =
+Added Last Month (Snap) =
 VAR LastW = MAX ( Snap_W[SnapshotDate] )
 VAR LastM = MAX ( Snap_M[SnapshotDate] )
-RETURN
-    IF (
-        LastW >= LastM || ISBLANK ( LastM ),
-        CALCULATE ( SUM ( Snap_W[Records] ), Snap_W[SnapshotDate] = LastW ),
-        CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = LastM )
-    )
+VAR PrevM = CALCULATE ( MAX ( Snap_M[SnapshotDate] ), Snap_M[SnapshotDate] < LastM )
+VAR MTot  = CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = LastM )
+VAR Cur =
+    IF ( LastW > LastM,
+         CALCULATE ( SUM ( Snap_W[Records] ), Snap_W[SnapshotDate] = LastW ),
+         MTot )
+VAR Prev =
+    IF ( LastW > LastM,
+         MTot,
+         CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = PrevM ) )
+RETURN IF ( NOT ISBLANK ( Prev ), Cur - Prev )
