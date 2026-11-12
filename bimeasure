@@ -1,41 +1,37 @@
-DEFINE
-    MEASURE _Measures[Grain Sel] = SELECTEDVALUE ( 'Snapshot Grain'[Snapshot Grain Order], 0 )
-
-    MEASURE _Measures[Snap W Date] = CALCULATE ( MAX ( Snap_W[SnapshotDate] ) )
-    MEASURE _Measures[Snap M Date] = CALCULATE ( MAX ( Snap_M[SnapshotDate] ) )
-    MEASURE _Measures[Snap Y Date] = CALCULATE ( MAX ( Snap_Y[SnapshotDate] ) )
-
-    MEASURE _Measures[Snap Total W] =
-        VAR d = [Snap W Date]
-        RETURN CALCULATE ( SUM ( Snap_W[Records] ), Snap_W[SnapshotDate] = d )
-    MEASURE _Measures[Snap Total M] =
-        VAR d = [Snap M Date]
-        RETURN CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = d )
-    MEASURE _Measures[Snap Total Y] =
-        VAR d = [Snap Y Date]
-        RETURN CALCULATE ( SUM ( Snap_Y[Records] ), Snap_Y[SnapshotDate] = d )
-
-    MEASURE _Measures[Snap Total Sel] =
-        SWITCH ( [Grain Sel], 0, [Snap Total W], 1, [Snap Total M], [Snap Total Y] )
-
-    MEASURE _Measures[Added Last Week (Snap)] =
-        VAR cur  = [Snap W Date]
-        VAR prev = CALCULATE ( MAX ( Snap_W[SnapshotDate] ), REMOVEFILTERS ( Date_Ingest ), Snap_W[SnapshotDate] < cur )
-        VAR prevT = CALCULATE ( SUM ( Snap_W[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_W[SnapshotDate] = prev )
-        RETURN IF ( NOT ISBLANK ( prev ), [Snap Total W] - prevT )
-
-    MEASURE _Measures[Added Last Month (Snap)] =
-        VAR cur  = [Snap M Date]
-        VAR prev = CALCULATE ( MAX ( Snap_M[SnapshotDate] ), REMOVEFILTERS ( Date_Ingest ), Snap_M[SnapshotDate] < cur )
-        VAR prevT = CALCULATE ( SUM ( Snap_M[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_M[SnapshotDate] = prev )
-        RETURN IF ( NOT ISBLANK ( prev ), [Snap Total M] - prevT )
-
-    MEASURE _Measures[Matched (Ingest Axis)] =
-        CALCULATE (
-            [Total Matches],
-            TREATAS ( VALUES ( Date_Ingest[Date] ), DateTable[Date] ),
-            TREATAS ( VALUES ( Dim_Country[Country] ), CrossRef_Matches[Country] )
+Snap Total M (Provisional) =
+VAR MonthStart = MIN ( Date_Ingest[Date] )
+VAR MonthEnd   = MAX ( Date_Ingest[Date] )
+VAR MonthSnap  = [Snap Total M]
+VAR LastMSnap  = CALCULATE ( MAX ( Snap_M[SnapshotDate] ), ALL ( Snap_M ) )
+VAR LastWInPeriod =
+    CALCULATE (
+        MAX ( Snap_W[SnapshotDate] ),
+        ALL ( Date_Ingest ),
+        Snap_W[SnapshotDate] >= MonthStart,
+        Snap_W[SnapshotDate] <= MonthEnd
+    )
+RETURN
+    IF (
+        NOT ISBLANK ( MonthSnap ),
+        MonthSnap,                                        -- monthly snapshot hai: wahi lo
+        IF (
+            MonthStart > LastMSnap && NOT ISBLANK ( LastWInPeriod ),
+            CALCULATE (                                   -- warna us mahine ka latest weekly lo
+                SUM ( Snap_W[Records] ),
+                ALL ( Date_Ingest ),
+                Snap_W[SnapshotDate] = LastWInPeriod
+            )
         )
+    )
 
-EVALUATE
-    ROW ( "Total", [Snap Total W], "AddWeek", [Added Last Week (Snap)], "AddMonth", [Added Last Month (Snap)] )
+
+
+
+---------
+
+
+Snap Total Sel =
+SWITCH ( [Grain Sel],
+    0, [Snap Total W],
+    1, [Snap Total M (Provisional)]
+)
