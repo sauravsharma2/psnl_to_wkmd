@@ -563,4 +563,1316 @@ def process_separated_address(address, postcode, city):
     # city apart from a street name, which a token scan cannot.
     if street and (not city or not state):
         u_city, u_state = _usaddress_city_state(street)
-        if not city and u_city
+        if not city and u_city:
+            city = u_city
+            street = remove_word_from_text(u_city, street)
+        if not state and u_state:
+            state = STATE_ABBR_TO_FULL.get(u_state.upper(), u_state.upper())
+            street = remove_word_from_text(u_state, street)
+
+    return {
+        "street": street if street else None,
+        "city": city if city else None,
+        "postcode": postcode if postcode else None,
+        "state": state if state else None,
+    }
+
+
+
+def parse_separated(row, prefix):
+    addr = row.get(f"Address {prefix}", "")
+    post = row.get(f"Postcode {prefix}", "")
+    city = row.get(f"City {prefix}", "")
+    parsed = process_separated_address(addr, post, city)
+    return pd.Series({
+        f"Street{prefix}": parsed["street"],
+        f"City{prefix}": parsed["city"],
+        f"State{prefix}": parsed["state"],
+        f"PostalCode{prefix}": parsed["postcode"]
+    })
+
+def calculate_address_similarity(addr1, addr2):
+    val1norm = normalize_text(addr1) if pd.notna(addr1) else ""
+    val2norm = normalize_text(addr2) if pd.notna(addr2) else ""
+
+    if not val1norm or not val2norm:
+        return 0.0
+
+    # Inclusion “forte” (maintenant que GRN->GREEN et que le numéro est conservé)
+    if len(val1norm) >= 5 and len(val2norm) >= 5:
+        if val1norm in val2norm or val2norm in val1norm:
+            return 100.0
+
+    return SequenceMatcher(None, val1norm, val2norm).ratio() * 100
+
+
+
+def add_parsed_addresses(unique_df):
+    PARSED_COLS = [
+        "Street1", "City1", "State1", "PostalCode1",
+        "Street2", "City2", "State2", "PostalCode2",
+        "IsSamePostalCode", "StreetSimilarity", "CitySimilarity", "IsSameState",
+    ]
+
+    # parallel_parse yields a column-less frame on empty input; return the
+    # expected schema so callers still get a usable empty frame.
+    if unique_df is None or unique_df.empty:
+        out = unique_df.copy() if unique_df is not None else pd.DataFrame()
+        for col in PARSED_COLS:
+            if col not in out.columns:
+                out[col] = pd.Series(dtype=object)
+        return out
+
+    def parallel_parse(df, prefix):
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            results = list(executor.map(lambda r: parse_separated(r, prefix), [row for _, row in df.iterrows()]))
+        return pd.DataFrame(results)
+
+    parsed_orig = parallel_parse(unique_df, "1")
+    parsed_match = parallel_parse(unique_df, "2")
+
+    unique_df = pd.concat([unique_df, parsed_orig, parsed_match], axis=1)
+
+    unique_df["IsSamePostalCode"] = (
+        (unique_df["PostalCode1"] == unique_df["PostalCode2"]) &
+        unique_df["PostalCode1"].notnull() & unique_df["PostalCode2"].notnull()
+    ).astype(int)
+
+    # --- MODIFICATION ICI ---
+    # Utilisation de la nouvelle fonction pour les adresses
+    unique_df["StreetSimilarity"] = unique_df.apply(
+        lambda row: calculate_address_similarity(row["Street1"], row["Street2"]), axis=1
+    )
+
+    # Pour la ville, on garde la méthode classique (souvent plus courte que 5 chars donc l'inclusion est risquée)
+    unique_df["CitySimilarity"] = unique_df.apply(
+        lambda row: calculate_similarity(row["City1"], row["City2"]), axis=1
+    )
+
+    # def same_state(row):
+    #     s1 = row.get("State1")
+    #     s2 = row.get("State2")
+    #     if not s1 or not s2:
+    #         return 0
+    #     return 1 if s1.upper() == s2.upper() else 0
+
+    def same_state(row):
+        s1, s2 = row["State1"], row["State2"]  # actual col names
+        if pd.isna(s1) or pd.isna(s2):
+            return 0
+        return 1 if str(s1).upper() == str(s2).upper() else 0
+
+    unique_df["IsSameState"] = unique_df.apply(same_state, axis=1)
+
+    raw_addr1 = unique_df["Address 1"].fillna("").str.lower()
+    raw_addr2 = unique_df["Address 2"].fillna("").str.lower()
+
+    # --- RÈGLE 1 : CT CORPORATION ---
+    # "corporation trust center" VS "1209 orange street"
+    pat_ctc = "corporation trust center"
+    pat_orange = "1209 orange street"
+
+    # Cas A : Gauche = CTC, Droite = Orange
+    mask_r1_a = raw_addr1.str.contains(pat_ctc, regex=False) & raw_addr2.str.contains(pat_orange, regex=False)
+    # Cas B : Gauche = Orange, Droite = CTC
+    mask_r1_b = raw_addr1.str.contains(pat_orange, regex=False) & raw_addr2.str.contains(pat_ctc, regex=False)
+
+    mask_rule_1 = mask_r1_a | mask_r1_b
+
+    # --- RÈGLE 2 : CSC (Corporation Service Company) ---
+    # "corporation service company" VS ("251 little falls" OU "2711 centerville road")
+    pat_csc = "corporation service company"
+    # Note : On cherche la partie fixe de l'adresse. "2711 centerville road" matchera automatiquement "... road, suite 400"
+    pat_locs_regex = r"251 little falls|2711 centerville road"
+
+    mask_csc_1 = raw_addr1.str.contains(pat_csc, regex=False)
+    mask_csc_2 = raw_addr2.str.contains(pat_csc, regex=False)
+
+    mask_locs_1 = raw_addr1.str.contains(pat_locs_regex, regex=True)
+    mask_locs_2 = raw_addr2.str.contains(pat_locs_regex, regex=True)
+
+    # Cas A : Gauche = CSC, Droite = Locs
+    mask_r2_a = mask_csc_1 & mask_locs_2
+    # Cas B : Gauche = Locs, Droite = CSC
+    mask_r2_b = mask_locs_1 & mask_csc_2
+
+    mask_rule_2 = mask_r2_a | mask_r2_b
+
+    # --- APPLICATION DES OVERRIDES ---
+    final_override_mask = mask_rule_1 | mask_rule_2
+
+    if final_override_mask.any():
+        # On force à 100% si l'une des règles est remplie
+        unique_df.loc[final_override_mask, "StreetSimilarity"] = 100.0
+        unique_df.loc[final_override_mask, "CitySimilarity"] = 100.0
+
+
+    return unique_df
+
+
+
+
+
+
+
+@connect_db
+def _fetch_oldest_link(conn, orig_ids: List[str]) -> pd.DataFrame:
+    ids = [str(x) for x in orig_ids if pd.notna(x)]
+    if not ids:
+        return pd.DataFrame(columns=["OriginalId", "OldestSourceDate"])
+
+    with conn.cursor() as cur:
+        # Création table temporaire
+        cur.execute("CREATE TABLE #TempIds (Id varchar(255) NOT NULL PRIMARY KEY);")
+
+        # Insertion par lots
+        chunk_size = 1000
+        for i in range(0, len(ids), chunk_size):
+            chunk = ids[i:i + chunk_size]
+            values_str = ",".join(f"('{x}')" for x in chunk)
+            cur.execute(f"INSERT INTO #TempIds (Id) VALUES {values_str};")
+
+        # Charger la requête principale depuis fichier
+        sql_tpl = load_query("queries/get_oldest_link_date.sql")
+        sql = sql_tpl.format(orig_values="")  # Orig_values n'est plus utilisé ici
+
+        # Exécution de la requête principale
+        cur.execute(sql)
+        cols = [c[0] for c in cur.description]
+        rows = cur.fetchall()
+
+        # Drop table temporaire
+        cur.execute("DROP TABLE #TempIds;")
+
+    if not rows:
+        return pd.DataFrame(columns=["OriginalId", "OldestSourceDate"])
+    return pd.DataFrame.from_records(rows, columns=cols).astype({"OriginalId": "string", "OldestSourceDate": "string"})
+
+
+def run() -> tuple[int, dict]:
+    """
+    Orchestrates the full matching pipeline and produces:
+      - matches_delaware.xlsx (Entries, Matching_Propositions, Delaware_Single_Match,
+        DirectLinked, directid_Same_City_State, directid_Same_city,
+        multiple_directid_delaware, NoMatch)
+      - output.txt   (only UniqueMatch as OldID/NewID/UserID)
+
+    The tier tables (UniqueMatch, the ExactName sheets and so on) are still
+    calculated — they feed the Delaware phases — but are no longer written to a
+    workbook of their own.
+
+    High-level steps:
+      1) Load cases (SQL) and prepare base columns.
+      2) Parallel per-country exact matching (normalized keys).
+      3) Deduplicate (prefer current ID over 'ID!').
+      4) Apply isolation filters + solo fallback rules.
+      5) Normalize names for export.
+      6) Export Excel and TXT.
+    """
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+
+    import pandas as pd
+
+    pd.set_option('display.max_rows', None)
+    pd.set_option('display.max_columns', None)
+    pd.set_option('display.width', 0)
+    pd.set_option('display.max_colwidth', None)
+    """
+    s = pd.Series("E-CAPITAL I")
+    print(exact_normalization_series(s))
+    return
+    """
+    warnings.filterwarnings("ignore")
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # --- 1) Load + base prep -------------------------------------------------
+    print("[1] Fetching cases...")
+    df_cases = get_cases()
+    #df_cases = get_cases_from_txt("Entries US.txt")
+    print(f"→ {len(df_cases)} cases retrieved.")
+
+    df_cases = (
+        df_cases
+        .rename(columns={"Id": "OriginalId"})
+        .assign(CleanedName=lambda df: df["Name"])
+    )
+
+    df_cases["CountryCode"] = df_cases["OriginalId"].astype(str).str[:2]
+    df_cases = df_cases.sort_values(by=["CleanedName", "CountryCode"])
+
+    print(f"[2] {len(df_cases)} cases to process.")
+    print("Countries to process:", df_cases["CountryCode"].unique())
+
+    # Country scheduling (priorities first, then the rest)
+    priority_countries = ["US", "CN", "FR"]
+    all_countries = list(df_cases["CountryCode"].unique())
+    sorted_countries = priority_countries + [c for c in all_countries if c not in priority_countries]
+    """
+    # Test subset
+    test_countries = {"BR"}
+    sorted_countries = [c for c in sorted_countries if c in test_countries]
+    print(f"[INFO] Selected countries for test run: {', '.join(sorted_countries) if sorted_countries else '(none)'}")
+    """
+
+    # --- 2) Matching per-country -----------------------------
+    print("[MATCH] Launching country matching...")
+    unique_countries = list(dict.fromkeys(sorted_countries))
+
+    matched_df = pd.DataFrame()
+
+    tCOuntries = time.perf_counter()
+
+    if unique_countries:
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            future_to_country = {
+                executor.submit(
+                    get_matched_ids,
+                    df_cases[df_cases["CountryCode"] == country][["OriginalId", "Name", "CleanedName", "CountryCode"]],
+                    country
+                ): country
+                for country in unique_countries
+                if not df_cases[df_cases["CountryCode"] == country].empty
+            }
+            for fut in as_completed(future_to_country):
+                country = future_to_country[fut]
+                try:
+                    df_matched, elapsed = fut.result()
+                    print(f"[MATCH] {country} done: {len(df_matched)} matches in {elapsed:.2f}s")
+                    if not df_matched.empty:
+                        matched_df = pd.concat([matched_df, df_matched], ignore_index=True)
+                except Exception as e:
+                    print(f"[ERROR] Matching failed for {country}: {e}")
+    else:
+        print("[MATCH] No countries selected, skipping matching.")
+
+    elapsed_countries = time.perf_counter() - tCOuntries
+    hours, rem = divmod(elapsed_countries, 3600)
+    minutes, seconds = divmod(rem, 60)
+
+    matched_df_raw = matched_df.copy()
+
+    # --- 2bis) Isolated ids: self-match against the full Entries pool --------
+    # "Isolated" = OriginalId got ZERO proposals from the normal matching pass.
+    # We re-run the SAME matcher for these ids only, then keep proposals whose
+    # MatchedId is itself an Entries OriginalId (Entries-vs-Entries only).
+    # Resulting rows are merged straight into matched_df_raw so they flow
+    # through the exact same de-dup / tiering logic as every other match —
+    # no separate sheet, no separate logic.
+    try:
+        _proposed_ids = set(matched_df_raw["OriginalId"].astype(str)) if not matched_df_raw.empty else set()
+        _entries_id_set = set(df_cases["OriginalId"].astype(str))
+        _isolated_ids = _entries_id_set - _proposed_ids
+
+        if _isolated_ids:
+            print(f"[ISOLATED] {len(_isolated_ids)} isolated ids (zero proposals) — self-matching against Entries...")
+            iso_cases = df_cases[df_cases["OriginalId"].astype(str).isin(_isolated_ids)][
+                ["OriginalId", "Name", "CleanedName", "CountryCode"]
+            ]
+            iso_matched_df = pd.DataFrame()
+            iso_countries = list(iso_cases["CountryCode"].unique())
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future_to_country = {
+                    executor.submit(
+                        get_matched_ids,
+                        iso_cases[iso_cases["CountryCode"] == c],
+                        c
+                    ): c
+                    for c in iso_countries
+                    if not iso_cases[iso_cases["CountryCode"] == c].empty
+                }
+                for fut in as_completed(future_to_country):
+                    c = future_to_country[fut]
+                    try:
+                        df_m, _el = fut.result()
+                        if df_m is not None and not df_m.empty:
+                            iso_matched_df = pd.concat([iso_matched_df, df_m], ignore_index=True)
+                    except Exception as e:
+                        print(f"[ISOLATED][ERROR] self-match failed for {c}: {e}")
+
+            if not iso_matched_df.empty:
+                iso_matched_df["OriginalId"] = iso_matched_df["OriginalId"].astype(str)
+                iso_matched_df["MatchedId"] = iso_matched_df["MatchedId"].astype(str)
+                # Entries-vs-Entries only: keep matches whose MatchedId is a real Entries id.
+                iso_matched_df = iso_matched_df[
+                    iso_matched_df["MatchedId"].str.rstrip("!").isin(_entries_id_set)
+                ]
+                print(f"[ISOLATED] {len(iso_matched_df)} self-matched rows found within Entries pool.")
+                matched_df_raw = pd.concat([matched_df_raw, iso_matched_df], ignore_index=True)
+    except Exception as e:
+        print(f"[ISOLATED][ERROR] isolated-id self-matching step failed, skipping: {e}")
+
+    # A run with no matches at all leaves a column-less frame; give it the
+    # schema the rest of the pipeline indexes into.
+    for _col in ("OriginalId", "Name", "MatchedId", "MatchedName"):
+        if _col not in matched_df_raw.columns:
+            matched_df_raw[_col] = pd.Series(dtype=object)
+
+    matched_df_raw = matched_df_raw[matched_df_raw["OriginalId"] != matched_df_raw["MatchedId"]]
+
+    matched_df_raw["_min_id"] = np.where(
+        matched_df_raw["OriginalId"].astype(str) < matched_df_raw["MatchedId"].astype(str),
+        matched_df_raw["OriginalId"], matched_df_raw["MatchedId"]
+    )
+    matched_df_raw["_max_id"] = np.where(
+        matched_df_raw["OriginalId"].astype(str) >= matched_df_raw["MatchedId"].astype(str),
+        matched_df_raw["OriginalId"], matched_df_raw["MatchedId"]
+    )
+    mask_keep = ~matched_df_raw.duplicated(subset=["_min_id", "_max_id"], keep="first")
+    removed_df = matched_df_raw.loc[~mask_keep]  # Pour log éventuellement
+    matched_df_raw = matched_df_raw.loc[mask_keep].copy()
+    matched_df_raw = matched_df_raw.drop(columns=["_min_id", "_max_id"])
+
+    print(f"[COUNTRIES AND TIMER] Total: {len(matched_df)} matches in {hours:.0f}h {minutes:.0f}m {seconds:.1f}s "
+          f"({elapsed_countries / 60:.2f} min, {elapsed_countries:.1f} s)")
+
+
+    # --- 3) Deduplicate and filtering pipeline -------------------------------
+
+    if matched_df_raw.empty:
+        export_df = pd.DataFrame(columns=[
+            "OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName", "IsolationFilter"
+        ])
+    else:
+        export_df = matched_df_raw.copy()
+
+        # De-dupe rule: prefer current ID over ex-ID (ID!) for the same OriginalId/MatchedId
+        export_df["OriginalId"] = export_df["OriginalId"].astype(str)
+        export_df["MatchedId"] = export_df["MatchedId"].astype(str)
+
+        export_df = export_df[export_df["OriginalId"] != export_df["MatchedId"]]
+
+        s = export_df["MatchedId"]
+        export_df["_base"] = s.str.rstrip("!")
+        export_df["_is_current"] = ~s.str.endswith("!")
+
+        dup = export_df.duplicated(subset=["OriginalId", "_base"], keep=False)
+        if dup.any():
+            idx_pref = export_df.loc[dup].groupby(["OriginalId", "_base"])["_is_current"].idxmax()
+            keep_idx = pd.Index(idx_pref).union(export_df.index[~dup])
+            export_df = export_df.loc[keep_idx]
+
+        export_df = export_df.drop(columns=["_base", "_is_current"])
+
+        # Sets IsolationFilter when a step makes the group unique
+        #export_df = apply_filters_pipeline(export_df)
+
+        # Solo fallback 1: UO check, then links check (subsidiaries/shareholders)
+        t_solo = time.perf_counter()
+        #export_df = solo_match_uo_then_links_check(export_df)
+        print(f"[FILTER] SOLO_UO {time.perf_counter() - t_solo:.3f}s")
+
+        # Ensure CountryCode exists for normalization
+        if "CountryCode" not in export_df.columns:
+            export_df["CountryCode"] = export_df["OriginalId"].astype(str).str[:2]
+
+
+        export_df["NameNormalized"] = pd.Series(index=export_df.index, dtype=object)
+        for cc, group in export_df.groupby("CountryCode"):
+            export_df.loc[group.index, "NameNormalized"] = exact_normalization_series(
+                group["Name"], country_code=cc
+            )["compact"].values
+
+
+        # Solo fallback 2: guard for very short normalized names (<=3)
+        #export_df = solo_shortname_guard(export_df)
+
+
+
+        # Solo fallback 3: Solo Validation
+        t_solo = time.perf_counter()
+        #export_df = solo_validation(export_df)
+        print(f"[FILTER] SOLO_VALIDATION {time.perf_counter() - t_solo:.3f}s")
+
+
+
+
+        cols = ["OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName"]
+
+        # Ajout plus direct de IsolationFilter sans mutation répétée
+        if "IsolationFilter" not in export_df.columns:
+            export_df = export_df.assign(IsolationFilter=pd.NA)
+
+        cols.append("IsolationFilter")
+
+        export_df = export_df.loc[:, cols]
+
+        # Casting des clés en catégorie pour accélérer le tri et opérations ultérieures
+        export_df["OriginalId"] = export_df["OriginalId"].astype("category")
+        export_df["MatchedId"] = export_df["MatchedId"].astype("category")
+
+        export_df = export_df.sort_values(["OriginalId", "MatchedId"], kind="stable", ignore_index=True)
+
+
+
+    # --- 4) UniqueMatch view --------------------------------------------------
+    if export_df.empty:
+        unique_df = pd.DataFrame(columns=[
+            "OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName", "IsolationFilter"
+        ])
+    else:
+        counts = export_df["OriginalId"].value_counts()
+        single_ids = counts[counts == 1].index
+
+        # Préparer un masque booléen (plus rapide sur gros DataFrames)
+        mask_single = export_df["OriginalId"].isin(single_ids)
+        unique_df = export_df.loc[mask_single].copy()
+
+        unique_df = unique_df.sort_values(
+            ["OriginalId", "MatchedId"], kind="stable", ignore_index=True
+        )
+
+    unique_df = add_city_similarity_columns(unique_df)
+
+    unique_df = add_parsed_addresses(unique_df)
+
+    # --- Add the oldest OriginalId link date in UniqueMatch -----------------
+
+    if not unique_df.empty:
+        # Query once for all unique OriginalIds
+        unique_ids = unique_df["OriginalId"].astype(str).unique().tolist()
+        oldest = _fetch_oldest_link(unique_ids)
+
+        # Left-merge to keep all rows in UniqueMatch
+        unique_df = (
+            unique_df.merge(oldest, on="OriginalId", how="left", validate="one_to_one")
+            .assign(OldestSourceDate=lambda d: d["OldestSourceDate"].astype("string"))
+        )
+
+        desired_cols = [
+            "OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName",
+            "IsolationFilter", "OldestSourceDate",
+        ]
+
+        existing_cols = [c for c in desired_cols if c in unique_df.columns]
+
+        # Ajout explicite des colonnes City à la fin
+        right_cols = ["City 1", "City 2", "Similarity", "Postcode 1", "Postcode 2", "Address 1", "Address 2", "NrLinks 1", "NrLinks 2"]
+
+        unique_df = unique_df[
+            existing_cols +
+            [c for c in unique_df.columns if c not in existing_cols + right_cols] +
+            right_cols
+            ]
+
+    # Snapshot of the fully enriched table (State1/State2/Street1/Street2 and
+    # similarity columns all present) taken before the tier extraction starts
+    # consuming unique_df. This is the input for matches_delaware.xlsx.
+    enriched_snapshot_df = unique_df.copy()
+
+    import pandas as pd
+    import re
+
+    # Fonction utilitaire : vérifier si chaîne vide ou sans lettre
+    def is_empty_or_no_letter(s):
+        if pd.isna(s) or s == "":
+            return True
+        return not any(c.isalpha() for c in str(s))
+
+    def extract_and_remove(df_source, condition, key_cols=None):
+        """
+        Sépare df_source en (extracted, remaining) à partir d'un masque booléen.
+        - condition doit être un Series booléen aligné sur df_source.index.
+        """
+        # Alignement explicite par index pour être sûr
+        condition = condition.reindex(df_source.index).fillna(False)
+
+        extracted_df = df_source[condition].copy()
+        remaining_df = df_source[~condition].copy()
+
+        # Pour l'export, on peut remettre les indices à plat pour le df extrait
+        extracted_df = extracted_df.reset_index(drop=True)
+
+        # On NE reset PAS remaining_df pour conserver la cohérence avec les masques déjà calculés
+        return extracted_df, remaining_df
+
+    # Normalisation des noms pour comparaisons exactes
+    def normalize_name(name):
+        name_lower = name.lower()
+        name_no_parens = re.sub(r'[()]', '', name_lower)
+        name_no_and = re.sub(r'\band\b', '', name_no_parens)
+        # Hyphens separate: "1997-XXX" must not glue into one token, or the
+        # sequence marker is lost and two different funds compare as one name.
+        name_no_and = re.sub(r'-', ' ', name_no_and)
+        name_clean = re.sub(r'[^\w\s]', '', name_no_and)
+        name_clean = re.sub(r'\s+', ' ', name_clean).strip()
+        return name_clean
+
+    # Conversion plus robuste NrLinks 2 en float
+    def to_float_nullable(series):
+        return pd.to_numeric(series, errors='coerce')
+
+    # Conditions sur unique_df
+    condition_address_empty = ~unique_df["Address 1"].fillna("").str.contains(r'[A-Za-z]', regex=True)
+    condition_city_empty = ~unique_df["City 1"].fillna("").str.contains(r'[A-Za-z]', regex=True)
+    condition_postcode_empty = ~unique_df["Postcode 1"].fillna("").str.contains(r'\d', regex=True)
+    condition_address_city = condition_address_empty & condition_city_empty & condition_postcode_empty
+
+
+    condition_matchedid = unique_df["MatchedId"].str.endswith(("L", "L!"), na=False)
+
+    nr_links_2_num = to_float_nullable(unique_df["NrLinks 2"])
+    condition_nrlinks2_zero_or_empty = nr_links_2_num.isna() | (nr_links_2_num == 0)
+    condition_nrlinks2_greater_than_zero = (nr_links_2_num > 0).fillna(False)
+
+    # 1. Extraire cas NoAddresses0Links (NrLinks null, 0, ou vide)
+    special_cases_no_links_df, unique_df = extract_and_remove(
+        unique_df, condition_address_city & condition_matchedid & condition_nrlinks2_zero_or_empty
+    )
+
+    # Normalisation des noms dans special_cases_no_links_df
+    special_cases_no_links_df["NormName"] = special_cases_no_links_df["Name"].astype(str).apply(normalize_name)
+    special_cases_no_links_df["NormMatchedName"] = special_cases_no_links_df["MatchedName"].astype(str).apply(
+        normalize_name)
+
+    mask_exact_name = special_cases_no_links_df["NormName"] == special_cases_no_links_df["NormMatchedName"]
+
+    special_cases_no_links_exact_name_df = special_cases_no_links_df[mask_exact_name].copy()
+
+    # Double sécurité en filtrant special_cases_no_links_exact_name_df sur NrLinks 2 nul ou vide, similaire à zero_or_empty
+    mask_zero_or_empty_exact = special_cases_no_links_exact_name_df["NrLinks 2"].fillna("").astype(str).isin(["0", ""])
+    special_cases_no_links_exact_name_df = special_cases_no_links_exact_name_df[mask_zero_or_empty_exact]
+
+    special_cases_no_links_df = special_cases_no_links_df[~mask_exact_name].copy()
+
+    # Assurer suppression stricte dans unique_df pour special_cases_no_links_df
+    common_cols = special_cases_no_links_df.columns.intersection(unique_df.columns).tolist()
+    if len(common_cols) > 0:
+        mask = unique_df[common_cols].apply(tuple, axis=1).isin(
+            special_cases_no_links_df[common_cols].apply(tuple, axis=1))
+        unique_df = unique_df.loc[~mask].copy()
+
+
+    special_cases_no_links_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+    special_cases_no_links_exact_name_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+
+    # 2. Extraire cas NoAddresses avec NrLinks > 0 (après conversion robuste)
+    special_cases_df, unique_df = extract_and_remove(
+        unique_df, condition_address_city & condition_matchedid & condition_nrlinks2_greater_than_zero
+    )
+
+    special_cases_df["NormName"] = special_cases_df["Name"].astype(str).apply(normalize_name)
+    special_cases_df["NormMatchedName"] = special_cases_df["MatchedName"].astype(str).apply(normalize_name)
+
+    mask_exact_name = special_cases_df["NormName"] == special_cases_df["NormMatchedName"]
+
+    special_cases_exact_name_df = special_cases_df[mask_exact_name].copy()
+
+    # Plus de robustesse ici aussi sur NrLinks 2 > 0 avec conversion float + safety
+    nr_links_2_exact_num = to_float_nullable(special_cases_exact_name_df["NrLinks 2"])
+    mask_gt_zero_exact = (nr_links_2_exact_num > 0).fillna(False)
+    special_cases_exact_name_df = special_cases_exact_name_df[mask_gt_zero_exact]
+
+    special_cases_df = special_cases_df[~mask_exact_name].copy()
+
+    # Suppression stricte dans unique_df pour special_cases_df
+    common_cols = special_cases_df.columns.intersection(unique_df.columns).tolist()
+    if len(common_cols) > 0:
+        mask = unique_df[common_cols].apply(tuple, axis=1).isin(special_cases_df[common_cols].apply(tuple, axis=1))
+        unique_df = unique_df.loc[~mask].copy()
+
+    special_cases_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+    special_cases_exact_name_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+
+    # ---------------------------------------------------------
+    # 3. Extraire cas Same State + Postcode
+    # ---------------------------------------------------------
+    # Condition : IsSamePostalCode == 1 ET IsSameState == 1
+    condition_state_postcode = (unique_df["IsSamePostalCode"] == 1) & (unique_df["IsSameState"] == 1)
+
+    special_cases_state_postcode_df, unique_df = extract_and_remove(
+        unique_df, condition_state_postcode
+    )
+
+    # Gestion Exact Name pour State+Postcode
+    special_cases_state_postcode_df["NormName"] = special_cases_state_postcode_df["Name"].astype(str).apply(
+        normalize_name)
+    special_cases_state_postcode_df["NormMatchedName"] = special_cases_state_postcode_df["MatchedName"].astype(
+        str).apply(normalize_name)
+
+    mask_exact_name_sp = special_cases_state_postcode_df["NormName"] == special_cases_state_postcode_df[
+        "NormMatchedName"]
+
+    special_cases_state_postcode_exact_df = special_cases_state_postcode_df[mask_exact_name_sp].copy()
+    special_cases_state_postcode_df = special_cases_state_postcode_df[~mask_exact_name_sp].copy()  # Reste (non exact)
+
+    # Suppression stricte dans unique_df (déjà fait par extract_and_remove, mais double check si besoin, ici extract_and_remove suffit généralement si les index sont alignés, mais gardons la logique safe si tu préfères)
+    # Note: extract_and_remove renvoie déjà le "remaining" unique_df, donc pas besoin de refaire le filtrage manuel "isin".
+
+    special_cases_state_postcode_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+    special_cases_state_postcode_exact_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+
+    # ---------------------------------------------------------
+    # 4. Extraire cas Same State + City (Similarity 100)
+    # ---------------------------------------------------------
+    # Condition : IsSameState == 1 ET CitySimilarity == 100
+    # Attention: CitySimilarity est float, parfois prudent de faire >= 99.99 ou conversion int, mais == 100 marche souvent si calculé proprement.
+    condition_state_city = (unique_df["IsSameState"] == 1) & (unique_df["CitySimilarity"] >= 100)
+
+    special_cases_state_city_df, unique_df = extract_and_remove(
+        unique_df, condition_state_city
+    )
+
+    # Gestion Exact Name pour State+City
+    special_cases_state_city_df["NormName"] = special_cases_state_city_df["Name"].astype(str).apply(normalize_name)
+    special_cases_state_city_df["NormMatchedName"] = special_cases_state_city_df["MatchedName"].astype(str).apply(
+        normalize_name)
+
+    mask_exact_name_sc = special_cases_state_city_df["NormName"] == special_cases_state_city_df["NormMatchedName"]
+
+    special_cases_state_city_exact_df = special_cases_state_city_df[mask_exact_name_sc].copy()
+    special_cases_state_city_df = special_cases_state_city_df[~mask_exact_name_sc].copy()
+
+    special_cases_state_city_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+    special_cases_state_city_exact_df.drop(columns=["NormName", "NormMatchedName"], inplace=True)
+
+    # ---------------------------------------------------------
+    # 5. Extraire cas Exact Name (restant)
+    # ---------------------------------------------------------
+    # On isole les cas restants dans unique_df qui ont exactement le même nom normalisé.
+    # Comme on n'a pas les colonnes normalisées dans unique_df, on crée le masque à la volée.
+
+    # Calcul des séries temporaires pour la condition
+    temp_norm_name = unique_df["Name"].astype(str).apply(normalize_name)
+    temp_norm_match = unique_df["MatchedName"].astype(str).apply(normalize_name)
+
+    condition_exact_name = (temp_norm_name == temp_norm_match)
+
+    exact_name_df, unique_df = extract_and_remove(
+        unique_df, condition_exact_name
+    )
+
+    # ---------------------------------------------------------
+
+    columns_to_remove = [
+        "City 1", "City 2", "Similarity", "Postcode 1", "Postcode 2", "Address 1", "Address 2"
+    ]
+
+    cols_to_drop = [col for col in columns_to_remove if col in unique_df.columns]
+
+    # Nettoyage final des colonnes pour TOUS les dataframes
+    dfs_to_clean = [
+        unique_df,
+        special_cases_no_links_df, special_cases_df, special_cases_no_links_exact_name_df, special_cases_exact_name_df,
+        special_cases_state_postcode_df, special_cases_state_postcode_exact_df,
+        special_cases_state_city_df, special_cases_state_city_exact_df,
+        exact_name_df
+    ]
+
+    for df in dfs_to_clean:
+        # On utilise intersection pour éviter erreur si colonne déjà absente
+        cols = df.columns.intersection(columns_to_remove)
+        if len(cols) > 0:
+            df.drop(columns=cols, inplace=True)
+
+    # --- 4bis) Client-approved validation rules (rows failing a rule are ------
+    #           dropped from that sheet; they remain visible only in
+    #           Matching_Propositions, nothing else changes for them). --------
+    # Recency on the matched record's LastTransferDate. None switches the rule
+    # off everywhere; set a yyyymmdd value (it was 20260401) to bring it back.
+    LAST_TRANSFER_CUTOFF = None
+
+    def _filter_recent_last_transfer(df):
+        if LAST_TRANSFER_CUTOFF is None:
+            return df
+        if df.empty or "LastTransferDate" not in df.columns:
+            return df
+        val = pd.to_numeric(df["LastTransferDate"], errors="coerce")
+        return df[val >= LAST_TRANSFER_CUTOFF].copy()
+
+    def _is_delaware(series):
+        """True where the parsed state is Delaware."""
+        return series.fillna("").astype(str).str.strip().str.upper().eq("DELAWARE")
+
+    def _delaware_no_street_exemption(df):
+        """
+        Delaware carve-out: many DE entities are registered with an agent and
+        carry no street address, so StreetSimilarity collapses to 0 and good
+        exact-name matches get dropped.
+
+        Exempt from the StreetSimilarity rule ONLY when BOTH:
+          - Street1 is empty (OriginalId side has no street), AND
+          - both sides are Delaware (State1 == State2 == DELAWARE).
+
+        All other rules (e.g. LastTransferDate) still apply to these rows.
+        """
+        if df.empty:
+            return pd.Series(False, index=df.index)
+        for col in ("Street1", "State1", "State2"):
+            if col not in df.columns:
+                return pd.Series(False, index=df.index)
+
+        street1_empty = ~df["Street1"].fillna("").astype(str).str.contains(
+            r"[A-Za-z0-9]", regex=True
+        )
+        both_delaware = _is_delaware(df["State1"]) & _is_delaware(df["State2"])
+        return street1_empty & both_delaware
+
+    def _filter_street_similarity(df, threshold):
+        if df.empty or "StreetSimilarity" not in df.columns:
+            return df
+        val = pd.to_numeric(df["StreetSimilarity"], errors="coerce")
+        keep = (val >= threshold) | _delaware_no_street_exemption(df)
+        return df[keep].copy()
+
+    # --- Registered-agent address exemption ---------------------------------
+    AGENT_ADDRESSES = _load_agent_addresses()
+
+    def _agent_address_exemption(df):
+        """
+        Registered-agent carve-out: a company's Delaware record often carries the
+        address of its registered agent (CSC, CT Corporation, ...) rather than its
+        own. Comparing that against the operating company's real street produces a
+        near-zero StreetSimilarity and drops an otherwise sound exact-name match.
+
+        Exempt from the StreetSimilarity rule when Street2 (the MatchedId side) is
+        a known registered-agent address. Matching is done on normalized text with
+        containment in either direction, so suite/unit suffixes still match.
+
+        All other rules (e.g. LastTransferDate) still apply to these rows.
+        """
+        if df.empty or not AGENT_ADDRESSES or "Street2" not in df.columns:
+            return pd.Series(False, index=df.index)
+
+        def _is_agent(value):
+            norm = normalize_text(value) if pd.notna(value) else ""
+            if not norm:
+                return False
+            return any(a in norm or norm in a for a in AGENT_ADDRESSES)
+
+        return df["Street2"].apply(_is_agent)
+
+    def _filter_street_similarity_with_agent(df, threshold):
+        """StreetSimilarity rule with both carve-outs applied."""
+        if df.empty or "StreetSimilarity" not in df.columns:
+            return df
+        val = pd.to_numeric(df["StreetSimilarity"], errors="coerce")
+        keep = (
+            (val >= threshold)
+            | _delaware_no_street_exemption(df)
+            | _agent_address_exemption(df)
+        )
+        return df[keep].copy()
+
+    def _add_validation_note(df):
+        """
+        Flag rows that were kept via an exemption rather than on street
+        similarity, so a reviewer can spot them at a glance:
+            "DE agent address" - Street2 is a registered-agent address
+            "DE no street"     - Street1 empty and both sides Delaware
+            ""                 - passed the StreetSimilarity rule normally
+        The column is appended at the end of the row.
+        """
+        if df.empty:
+            df["ValidationNote"] = pd.Series(dtype=object)
+            return df
+
+        note = pd.Series("", index=df.index, dtype=object)
+        note = note.mask(_delaware_no_street_exemption(df), "DE no street")
+        # Agent-address takes precedence when both would apply.
+        note = note.mask(_agent_address_exemption(df), "DE agent address")
+
+        df = df.copy()
+        df["ValidationNote"] = note
+        cols = [c for c in df.columns if c != "ValidationNote"] + ["ValidationNote"]
+        return df[cols]
+
+    # NoAddress_ExactName_0Links: recency only (off while the cutoff is None)
+    special_cases_no_links_exact_name_df = _filter_recent_last_transfer(
+        special_cases_no_links_exact_name_df
+    )
+
+    # NoAddress_ExactName: same rule as the 0Links variant
+    special_cases_exact_name_df = _filter_recent_last_transfer(special_cases_exact_name_df)
+
+    # Same_state_postcode_ExactName: StreetSimilarity >= 60
+    special_cases_state_postcode_exact_df = _filter_street_similarity_with_agent(
+        special_cases_state_postcode_exact_df, 60
+    )
+    special_cases_state_postcode_exact_df = _add_validation_note(
+        special_cases_state_postcode_exact_df
+    )
+
+    # Same_state_city_ExactName: StreetSimilarity >= 60
+    special_cases_state_city_exact_df = _filter_street_similarity_with_agent(
+        special_cases_state_city_exact_df, 60
+    )
+    special_cases_state_city_exact_df = _add_validation_note(
+        special_cases_state_city_exact_df
+    )
+
+    # Exact_name: recency (off while the cutoff is None) AND StreetSimilarity >= 78
+    exact_name_df = _filter_recent_last_transfer(exact_name_df)
+    exact_name_df = _filter_street_similarity_with_agent(exact_name_df, 78)
+    exact_name_df = _add_validation_note(exact_name_df)
+
+    print(
+        "[VALIDATION] NoAddress_ExactName_0Links="
+        f"{len(special_cases_no_links_exact_name_df)} | "
+        f"NoAddress_ExactName={len(special_cases_exact_name_df)} | "
+        f"Same_state_postcode_ExactName={len(special_cases_state_postcode_exact_df)} | "
+        f"Same_state_city_ExactName={len(special_cases_state_city_exact_df)} | "
+        f"Exact_name={len(exact_name_df)}"
+    )
+
+
+
+
+    # --- 5) NoMatch view ------------------------------
+    base_cases = (
+        df_cases[["OriginalId", "Name", "CountryCode"]]
+        .assign(OriginalId=lambda d: d["OriginalId"].astype(str))
+        .drop_duplicates(subset=["OriginalId"], keep="first")
+    )
+    matched_ids = set(export_df["OriginalId"].unique()) if not export_df.empty else set()
+    df_nomatch = base_cases[~base_cases["OriginalId"].isin(matched_ids)].copy()
+
+    if not df_nomatch.empty:
+        # Normalize for display consistency (uses country code per row)
+        df_nomatch["NameNormalized"] = pd.Series(index=df_nomatch.index, dtype=object)
+        for cc, group in df_nomatch.groupby("CountryCode"):
+            df_nomatch.loc[group.index, "NameNormalized"] = exact_normalization_series(
+                group["Name"], country_code=cc
+            )["compact"].values
+
+        df_nomatch = df_nomatch[["OriginalId", "Name", "NameNormalized"]].sort_values(
+            ["OriginalId"], kind="stable", ignore_index=True
+        )
+    else:
+        df_nomatch = pd.DataFrame(columns=["OriginalId", "Name", "NameNormalized"])
+
+    # --- 6) Display/Export artifacts -----------------------------------------
+
+    max_excel_rows = 1_000_000
+
+    def write_df_split(df, writer, base_sheet_name):
+        num_sheets = math.ceil(len(df) / max_excel_rows)
+        for i in range(num_sheets):
+            start = i * max_excel_rows
+            end = start + max_excel_rows
+            sheet_df = df.iloc[start:end]
+            sheet_name = f"{base_sheet_name}_{i + 1}" if num_sheets > 1 else base_sheet_name
+            sheet_df.to_excel(writer, index=False, sheet_name=sheet_name)
+
+    # Matching_Propositions is built here rather than at write time because the
+    # Delaware workbook below is the only consumer of it.
+    if matched_df_raw.empty:
+        matching_props = pd.DataFrame(columns=[
+            "OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName"
+        ])
+    else:
+        matched_df_raw["OriginalId"] = matched_df_raw["OriginalId"].astype(str)
+        df_cases["OriginalId"] = df_cases["OriginalId"].astype(str)
+        cases_base = df_cases[["OriginalId", "Name"]].copy()
+        df_merge = matched_df_raw.merge(cases_base, on="OriginalId", how="left")
+        df_merge = df_merge.rename(columns={"Name_y": "Name"})
+        if "Name_x" in df_merge.columns:
+            df_merge = df_merge.drop(columns=["Name_x"])
+        if "CountryCode" not in df_merge.columns:
+            df_merge["CountryCode"] = df_merge["OriginalId"].str[:2]
+
+        def safe_normalize(name, cc):
+            try:
+                return exact_normalization_series(pd.Series([name]), country_code=cc)["compact"].iloc[0]
+            except Exception as e:
+                print(f"[WARN] Normalization failed for '{name}' ({cc}): {e}")
+                return pd.NA
+
+        df_merge["NameNormalized"] = [
+            safe_normalize(n, c) for n, c in zip(df_merge["Name"], df_merge["CountryCode"])
+        ]
+
+        matching_props = df_merge[
+            ["OriginalId", "Name", "NameNormalized", "MatchedId", "MatchedName"]
+        ]
+        matching_props = _insert_blank_rows_between_groups(matching_props, "OriginalId")
+
+    print(
+        f"[TIERS] Matching_Propositions={len(matching_props)} | UniqueMatch={len(unique_df)} | "
+        f"Exact_name={len(exact_name_df)} | NoMatch={len(df_nomatch)}"
+    )
+
+    # --- 7) Second output file: matches_delaware.xlsx ------------------------
+    # Same Entries / Matching_Propositions / NoMatch as above, but the tier
+    # sheets are replaced by a single Delaware-focused sheet plus DirectLinked.
+    try:
+        de_selection = select_delaware_single_matches(
+            enriched_snapshot_df,
+            agent_addresses=AGENT_ADDRESSES,
+            normalize_text=normalize_text,
+            normalize_name=normalize_name,
+        )
+        print(f"[DELAWARE] {len(de_selection)} single-proposition Delaware rows selected")
+
+        # Phases 2 and 3 both need to know which OriginalIds phase 1 has already
+        # taken. de_selection is used rather than the post-split frames because
+        # it holds the same ids and is available before the ownership pass —
+        # which now has to wait until phase 3 has chosen its rows too.
+        _de_ids_both_sides = set()
+        for _col in ("OriginalId", "MatchedId"):
+            if _col in de_selection.columns:
+                _de_ids_both_sides |= set(de_selection[_col].dropna().astype(str))
+        _de_original_ids = (
+            set(de_selection["OriginalId"].dropna().astype(str))
+            if "OriginalId" in de_selection.columns else set()
+        )
+
+        # --- Step 2: same-name OriginalId grouping, address sheets ----------
+        # Needs the parsed address columns, so Entries ids are enriched here with
+        # the same city fetch + address parser the match table uses. The enriched
+        # frame is reused by step 4, which groups the address-less ids later in
+        # the cascade.
+        try:
+            # Both sides of Delaware_Single_Match are out of scope, here and in
+            # every later step: a pool id is never treated as an OriginalId.
+            de_handled = set(_de_ids_both_sides)
+
+            all_ids = [
+                i for i in df_cases["OriginalId"].astype(str).unique().tolist()
+                if i not in de_handled
+            ]
+            print(
+                f"[STEP2] {len(de_handled):,} ids excluded (Delaware_Single_Match, "
+                f"both sides) — {len(all_ids):,} ids to consider"
+            )
+            cities_all = _fetch_cities(all_ids)
+
+            base = df_cases[["OriginalId", "Name"]].copy()
+            base["OriginalId"] = base["OriginalId"].astype(str)
+            base = base[base["OriginalId"].isin(all_ids)]
+            base = base.merge(
+                cities_all.rename(columns={
+                    "Id": "OriginalId",
+                    "PCCity": "City 1",
+                    "Postcode": "Postcode 1",
+                    "Address": "Address 1",
+                    "NrLinks": "NrLinks 1",
+                }),
+                on="OriginalId",
+                how="left",
+            )
+            if "LastTransferDate" in base.columns:
+                base = base.drop(columns=["LastTransferDate"])
+
+            parsed = pd.DataFrame(
+                [parse_separated(r, "1") for _, r in base.iterrows()]
+            )
+            base = pd.concat([base.reset_index(drop=True), parsed.reset_index(drop=True)], axis=1)
+
+            base["NameNormalized"] = pd.Series(index=base.index, dtype=object)
+            _cc = df_cases.set_index(df_cases["OriginalId"].astype(str))["CountryCode"]
+            base["CountryCode"] = base["OriginalId"].map(_cc)
+            for cc, grp in base.groupby("CountryCode"):
+                base.loc[grp.index, "NameNormalized"] = exact_normalization_series(
+                    grp["Name"], country_code=cc
+                )["compact"].values
+
+            same_city_state_df, same_city_df, _ = build_directid_groups(
+                base,
+                normalize_name=normalize_name,
+                normalize_text=normalize_text,
+                excluded_ids=de_handled,
+                buckets=("address",),
+            )
+            print(
+                f"[STEP2] directid_Same_City_State={len(same_city_state_df)} | "
+                f"directid_Same_city={len(same_city_df)}"
+            )
+        except Exception as e:
+            print(f"[STEP2][ERROR] same-name grouping failed: {e}")
+            base = pd.DataFrame()
+            same_city_state_df = pd.DataFrame()
+            same_city_df = pd.DataFrame()
+
+        def _ids_of(frames, columns=("OriginalId",)):
+            """Collect the ids a set of frames has already claimed."""
+            out = set()
+            for _df in frames:
+                if _df is None or _df.empty:
+                    continue
+                for _col in columns:
+                    if _col in _df.columns:
+                        out |= set(_df[_col].dropna().astype(str))
+            return out
+
+        _BOTH = ("OriginalId", "MatchedId")
+        _step2_frames = (same_city_state_df, same_city_df)
+
+        # --- Step 3: direct-vs-good, both sides in the same place ------------
+        # The propositions themselves, filtered on the step 2 address test. No
+        # state is privileged; the two sides only have to agree.
+        try:
+            dvg_state_df, dvg_city_df = build_direct_vs_good(
+                enriched_snapshot_df,
+                normalize_text=normalize_text,
+                normalize_name=normalize_name,
+                excluded_ids=_de_ids_both_sides | _ids_of(_step2_frames),
+                last_transfer_cutoff=LAST_TRANSFER_CUTOFF,
+            )
+            print(
+                f"[STEP3] direct_vs_good_same_city_state={len(dvg_state_df)} | "
+                f"direct_vs_good_same_city={len(dvg_city_df)}"
+            )
+        except Exception as e:
+            print(f"[STEP3][ERROR] direct-vs-good failed: {e}")
+            dvg_state_df = pd.DataFrame()
+            dvg_city_df = pd.DataFrame()
+
+        _step3_frames = (dvg_state_df, dvg_city_df)
+
+        # --- Step 4: several OriginalIds sharing one Delaware MatchedId ------
+        try:
+            _step4_sel_excluded = (
+                _de_ids_both_sides | _ids_of(_step2_frames) | _ids_of(_step3_frames)
+            )
+            p3_selection = select_multiple_directid(
+                enriched_snapshot_df,
+                excluded_ids=_step4_sel_excluded,
+                agent_addresses=AGENT_ADDRESSES,
+                normalize_text=normalize_text,
+                normalize_name=normalize_name,
+                relations=("same_legal",),
+                delaware="require",
+                last_transfer_cutoff=LAST_TRANSFER_CUTOFF,
+                label="STEP4",
+            )
+        except Exception as e:
+            print(f"[STEP4][ERROR] selection failed: {e}")
+            p3_selection = pd.DataFrame()
+
+        # --- Step 5: the address-less grouping bucket ------------------------
+        # Runs late so an id whose proposition belongs to a shared Delaware
+        # cluster is not claimed here on the strength of its name alone.
+        try:
+            _step5_excluded = (
+                _de_ids_both_sides
+                | _ids_of(_step2_frames, _BOTH)
+                | _ids_of(_step3_frames, _BOTH)
+                | _ids_of((p3_selection,), _BOTH)
+            )
+            _, _, no_address_df = build_directid_groups(
+                base,
+                normalize_name=normalize_name,
+                normalize_text=normalize_text,
+                excluded_ids=_step5_excluded,
+                buckets=("no_address",),
+            )
+            print(f"[STEP5] directid_no_address={len(no_address_df)}")
+        except Exception as e:
+            print(f"[STEP5][ERROR] address-less grouping failed: {e}")
+            no_address_df = pd.DataFrame()
+
+        # --- Step 6: the remaining shared-target sheets ----------------------
+        # Same shape as step 4, narrowing by legal form and dropping the
+        # Delaware requirement. Each pass skips what the previous ones took, so
+        # an id lands in one sheet only.
+        try:
+            _handled = (
+                _de_ids_both_sides
+                | _ids_of(_step2_frames)
+                | _ids_of(_step3_frames)
+                | _ids_of((p3_selection,), _BOTH)
+                | _ids_of((no_address_df,))
+            )
+
+            _passes = [
+                ("p3_same_legal", ("same_legal",), "exclude", "STEP6-SAMELEGAL"),
+                ("p3_diff_legal", ("diff_legal",), "ignore", "STEP6-DIFFLEGAL"),
+                ("p3_no_legal", ("a_no_legal",), "ignore", "STEP6-NOLEGAL"),
+            ]
+            _p3_frames = {}
+            for key, rels, de_mode, tag in _passes:
+                sel = select_multiple_directid(
+                    enriched_snapshot_df,
+                    excluded_ids=_handled,
+                    agent_addresses=AGENT_ADDRESSES,
+                    normalize_text=normalize_text,
+                    normalize_name=normalize_name,
+                    relations=rels,
+                    delaware=de_mode,
+                    last_transfer_cutoff=LAST_TRANSFER_CUTOFF,
+                    label=tag,
+                )
+                _p3_frames[key] = sel
+                if not sel.empty and "OriginalId" in sel.columns:
+                    _handled |= set(sel["OriginalId"].astype(str))
+
+            p3_same_legal_sel = _p3_frames["p3_same_legal"]
+            p3_diff_legal_sel = _p3_frames["p3_diff_legal"]
+            p3_no_legal_sel = _p3_frames["p3_no_legal"]
+        except Exception as e:
+            print(f"[STEP6][ERROR] selection failed: {e}")
+            p3_same_legal_sel = pd.DataFrame()
+            p3_diff_legal_sel = pd.DataFrame()
+            p3_no_legal_sel = pd.DataFrame()
+
+        # --- Ownership pass: one fetch covering phase 1 and phase 3 ----------
+        # Phase 3's ids are not known until its selection has run, so the fetch
+        # waits for both and covers them in a single round trip.
+        try:
+            _own_ids = set()
+            for _df in (de_selection, p3_selection, p3_same_legal_sel,
+                        p3_diff_legal_sel, p3_no_legal_sel,
+                        same_city_state_df, same_city_df, no_address_df,
+                        dvg_state_df, dvg_city_df):
+                if _df is None or _df.empty:
+                    continue
+                for _col in ("OriginalId", "MatchedId"):
+                    if _col in _df.columns:
+                        _own_ids |= set(_df[_col].dropna().astype(str))
+
+            if _own_ids:
+                _link_rows, _uo_rows = _fetch_ownership_links(_own_ids)
+                _ownership = build_ownership_map(_link_rows, _uo_rows)
+            else:
+                _ownership = {}
+
+            de_main_df, _dl_phase1 = split_direct_linked(de_selection, _ownership)
+            p3_main_df, _dl_p3 = split_direct_linked(p3_selection, _ownership)
+            p3_same_legal_df, _dl_sl = split_direct_linked(p3_same_legal_sel, _ownership)
+            p3_diff_legal_df, _dl_dl = split_direct_linked(p3_diff_legal_sel, _ownership)
+            p3_no_legal_df, _dl_nl = split_direct_linked(p3_no_legal_sel, _ownership)
+
+            # Every phase contributes to the one DirectLinked sheet.
+            _dl_parts = [d for d in (_dl_phase1, _dl_p3, _dl_sl, _dl_dl, _dl_nl)
+                         if d is not None and not d.empty]
+            direct_linked_df = (
+                pd.concat(_dl_parts, ignore_index=True) if _dl_parts else _dl_phase1
+            )
+
+            same_city_state_df = stamp_ownership(same_city_state_df, _ownership)
+            same_city_df = stamp_ownership(same_city_df, _ownership)
+            no_address_df = stamp_ownership(no_address_df, _ownership)
+            dvg_state_df = stamp_ownership(dvg_state_df, _ownership)
+            dvg_city_df = stamp_ownership(dvg_city_df, _ownership)
+            direct_linked_df = stamp_ownership(direct_linked_df, _ownership)
+        except Exception as e:
+            print(f"[OWNERSHIP][ERROR] ownership pass failed: {e}")
+            de_main_df = de_selection.copy()
+            p3_main_df = p3_selection.copy()
+            p3_same_legal_df = p3_same_legal_sel.copy()
+            p3_diff_legal_df = p3_diff_legal_sel.copy()
+            p3_no_legal_df = p3_no_legal_sel.copy()
+            direct_linked_df = pd.DataFrame()
+
+        print(
+            f"[DELAWARE] Delaware_Single_Match={len(de_main_df)} | "
+            f"multiple_directid_delaware={len(p3_main_df)} | "
+            f"DirectLinked={len(direct_linked_df)}"
+        )
+
+        de_path = os.path.join(OUTPUT_DIR, "matches_delaware.xlsx")
+        with pd.ExcelWriter(de_path) as de_writer:
+            wrote_any = False
+
+            df_entries_de = df_cases[["OriginalId", "Name"]].copy()
+            if not df_entries_de.empty:
+                write_df_split(df_entries_de, de_writer, "Entries")
+                wrote_any = True
+
+            if not matching_props.empty:
+                write_df_split(matching_props, de_writer, "Matching_Propositions")
+                wrote_any = True
+
+            if not de_main_df.empty:
+                write_df_split(de_main_df, de_writer, "Delaware_Single_Match")
+                wrote_any = True
+
+            if not direct_linked_df.empty:
+                write_df_split(direct_linked_df, de_writer, "DirectLinked")
+                wrote_any = True
+
+            if not same_city_state_df.empty:
+                write_df_split(same_city_state_df, de_writer, "directid_Same_City_State")
+                wrote_any = True
+
+            if not same_city_df.empty:
+                write_df_split(same_city_df, de_writer, "directid_Same_city")
+                wrote_any = True
+
+            for _frame, _sheet in (
+                (dvg_state_df, "direct_vs_good_same_city_state"),
+                (dvg_city_df, "direct_vs_good_same_city"),
+            ):
+                if _frame is not None and not _frame.empty:
+                    write_df_split(_frame, de_writer, _sheet)
+                    wrote_any = True
+
+            if not no_address_df.empty:
+                write_df_split(no_address_df, de_writer, "directid_no_address")
+                wrote_any = True
+
+            if not p3_main_df.empty:
+                write_df_split(p3_main_df, de_writer, "multiple_directid_delaware")
+                wrote_any = True
+
+            for _frame, _sheet in (
+                (p3_same_legal_df, "multiple_directid_same_legal"),
+                (p3_diff_legal_df, "multiple_directid_diff_legal"),
+                (p3_no_legal_df, "multiple_directid_no_legal"),
+            ):
+                if _frame is not None and not _frame.empty:
+                    write_df_split(_frame, de_writer, _sheet)
+                    wrote_any = True
+
+            if not df_nomatch.empty:
+                write_df_split(df_nomatch, de_writer, "NoMatch")
+                wrote_any = True
+
+            if not wrote_any:
+                pd.DataFrame(["No data to export"]).to_excel(
+                    de_writer, index=False, sheet_name="Empty"
+                )
+
+        print(f"[EXPORT] Excel: {de_path}")
+    except Exception as e:
+        print(f"[EXPORT][ERROR] Impossible d'écrire matches_delaware.xlsx: {e}")
+
+
+
+
+if __name__ == "__main__":
+    t0 = time.perf_counter()
+
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    exit_code = 0
+    metrics = {}
+    extra=[]
+    try:
+        run()
+
+    except Exception as e:
+        exit_code = 1
+        metrics = {"error": 1}
+        traceback.print_exc()
+
+
+    finally:
+        out_file = os.path.join(OUTPUT_DIR, "matches_delaware.xlsx")
+        # Construis la liste d'artefacts additionnels
+        extra = []
+        p = Path(out_file)
+        if p.exists():
+            extra.append((str(p), "file", "xlsx", False))
+
+
+        finalize_run(
+            project_name=PROJECT_NAME,
+            started_at=started_at,
+            exit_code=exit_code,
+            metrics=metrics,
+            require_primary_txt=True,  # TXT ici, donc True pour lever une erreur si on ne le trouve pas
+            extra_artifacts=extra,
+        )
+
+        elapsed_s = time.perf_counter() - t0
+        print(f"[TIMER] Total: {elapsed_s / 60:.2f} min ({elapsed_s:.1f} s)")
+
+        sys.exit(exit_code)
+
+
+
