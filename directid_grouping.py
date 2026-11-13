@@ -330,7 +330,7 @@ def build_direct_vs_good(
     normalize_text: Callable,
     normalize_name: Callable,
     excluded_ids: set = None,
-    last_transfer_cutoff: int = 20260401,
+    last_transfer_cutoff=None,
 ) -> tuple:
     """
     Direct-vs-Good: a proposition kept when both sides sit in the same place.
@@ -367,7 +367,7 @@ def build_direct_vs_good(
         work = work[~work["OriginalId"].isin(set(excluded_ids))]
         print(f"[DVG] {before - len(work):,} rows excluded (claimed earlier)")
 
-    if "LastTransferDate" in work.columns:
+    if last_transfer_cutoff is not None and "LastTransferDate" in work.columns:
         val = pd.to_numeric(work["LastTransferDate"], errors="coerce")
         work = work[val >= last_transfer_cutoff]
         print(f"[DVG] after LastTransferDate >= {last_transfer_cutoff}: {len(work):,} rows")
