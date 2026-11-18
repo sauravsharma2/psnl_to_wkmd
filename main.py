@@ -1,65 +1,99 @@
-%pip install xlsxwriter -q
+# Databricks notebook source
+# MAGIC %pip install xlsxwriter
+# MAGIC %restart_python
 
+# COMMAND ----------
 
-from pyspark.sql import functions as F
-import xlsxwriter, shutil, os, math
+import xlsxwriter, shutil, os
 
 # ---------------- CONFIG ----------------
-OUT_DIR   = "/Volumes/training_sandbox_dev/msof_direct/files"
-OBO_PATH  = f"{OUT_DIR}/obo.parquet"
-BASE_NAME = "orbis_vs_obo"
-MAX_ROWS  = 1_000_000          # per sheet (Excel limit 1,048,576)
-TMP_DIR   = "/local_disk0/tmp"
+OUT_DIR  = "/Volumes/training_sandbox_dev/msof_direct/files"
+MAX_ROWS = 1_000_000          # rows per Excel file (Excel limit 1,048,576)
+TMP_DIR  = "/tmp"
 # ----------------------------------------
 
-spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")
-norm = lambda c: F.upper(F.trim(F.col(c).cast("string")))
+QUERIES = {
+    # BvD ID contains '*'  -> direct_id
+    "direct_id": """
+        SELECT BvD_ID_number
+        FROM prd_bronze_orbis.orbis.legal_info AS legal_info
+        WHERE legal_info.Information_provider = 'BvD ownership database'
+          AND BvD_ID_number LIKE '%*%'
+    """,
+    # BvD ID without '*'   -> non_direct
+    "non_direct": """
+        SELECT BvD_ID_number
+        FROM prd_bronze_orbis.orbis.legal_info AS legal_info
+        WHERE legal_info.Information_provider = 'BvD ownership database'
+          AND BvD_ID_number NOT LIKE '%*%'
+    """,
+}
 
-# 1. OBO parquet (first column = BvD ID)
-obo_raw = spark.read.parquet(OBO_PATH)
-obo = (obo_raw.select(norm(obo_raw.columns[0]).alias("bvd_id"))
-       .where("bvd_id IS NOT NULL AND bvd_id <> ''")
-       .distinct())
+# COMMAND ----------
 
-# 2. ORBIS query
-orbis = (spark.sql("""
-            SELECT BvD_ID_number
-            FROM prd_bronze_orbis.orbis.legal_info
-            WHERE Information_provider = 'BvD ownership database'
-         """)
-         .select(norm("BvD_ID_number").alias("bvd_id"))
-         .where("bvd_id IS NOT NULL AND bvd_id <> ''")
-         .distinct())
+def _clean(v):
+    # xlsxwriter handles str/int/float/None; cast anything else (Decimal, date...) to str
+    return v if v is None or isinstance(v, (str, int, float)) else str(v)
 
-orbis.cache(); obo.cache()
-print(f"ORBIS distinct: {orbis.count():,} | OBO distinct: {obo.count():,}")
 
-# 3. Compare
-orbis_only = orbis.join(obo, "bvd_id", "left_anti")   # in ORBIS, not in OBO
-obo_only   = obo.join(orbis, "bvd_id", "left_anti")   # in OBO, not in ORBIS
+def export_to_excel(df, base_name):
+    """Stream a Spark DF into Excel files of MAX_ROWS each.
+    File 1 = <base_name>.xlsx, then <base_name>_part2.xlsx, _part3.xlsx ...
+    Returns (total_rows, list_of_files)."""
+    cols = df.columns
+    files = []
+    state = {}
 
-o_ids = sorted(orbis_only.toPandas()["bvd_id"].tolist())
-b_ids = sorted(obo_only.toPandas()["bvd_id"].tolist())
-print(f"orbis_only: {len(o_ids):,} | obo_only: {len(b_ids):,}")
+    def open_part(p):
+        name = f"{base_name}.xlsx" if p == 1 else f"{base_name}_part{p}.xlsx"
+        tmp_path = os.path.join(TMP_DIR, name)
+        wb = xlsxwriter.Workbook(tmp_path, {"constant_memory": True})
+        ws = wb.add_worksheet("data")
+        ws.write_row(0, 0, cols)
+        state.update(wb=wb, ws=ws, tmp=tmp_path, name=name)
 
-# 4. Write Excel (split into part files if > MAX_ROWS)
-os.makedirs(TMP_DIR, exist_ok=True)
-n_parts = max(math.ceil(len(o_ids) / MAX_ROWS),
-              math.ceil(len(b_ids) / MAX_ROWS), 1)
+    def close_part():
+        state["wb"].close()
+        dest = os.path.join(OUT_DIR, state["name"])
+        shutil.copyfile(state["tmp"], dest)   # /tmp -> Volume
+        os.remove(state["tmp"])
+        files.append(dest)
 
-for p in range(n_parts):
-    fname = f"{BASE_NAME}.xlsx" if n_parts == 1 else f"{BASE_NAME}_part{p+1}.xlsx"
-    tmp = f"{TMP_DIR}/{fname}"
-    s, e = p * MAX_ROWS, (p + 1) * MAX_ROWS
+    part, row_in_part, total = 1, 0, 0
+    open_part(part)
 
-    wb = xlsxwriter.Workbook(tmp, {"constant_memory": True})
-    for sheet, ids in [("orbis_only", o_ids), ("obo_only", b_ids)]:
-        ws = wb.add_worksheet(sheet)
-        ws.write(0, 0, "bvd_id")
-        ws.write_column(1, 0, ids[s:e])
-    wb.close()
+    for r in df.toLocalIterator(prefetchPartitions=True):
+        if row_in_part == MAX_ROWS:          # current file full -> start next part
+            close_part()
+            part += 1
+            row_in_part = 0
+            open_part(part)
+        state["ws"].write_row(row_in_part + 1, 0, [_clean(v) for v in r])
+        row_in_part += 1
+        total += 1
 
-    shutil.copy(tmp, f"{OUT_DIR}/{fname}")
-    print(f"Saved {fname}: orbis_only={len(o_ids[s:e]):,} | obo_only={len(b_ids[s:e]):,}")
+    close_part()
+    return total, files
 
-orbis.unpersist(); obo.unpersist()
+# COMMAND ----------
+
+os.makedirs(OUT_DIR, exist_ok=True)
+results = {}
+
+for base_name, sql in QUERIES.items():
+    print(f"Running '{base_name}' ...")
+    df = spark.sql(sql)
+    total, files = export_to_excel(df, base_name)
+    results[base_name] = (total, files)
+    print(f"  done -> {total:,} rows in {len(files)} file(s)")
+
+# COMMAND ----------
+
+print("=" * 55)
+print("SUMMARY")
+print("=" * 55)
+for base_name, (total, files) in results.items():
+    print(f"\n{base_name.upper()}  |  Total count: {total:,}")
+    for f in files:
+        print(f"   {f}")
+print("\nGrand total:", f"{sum(t for t, _ in results.values()):,}")
