@@ -1,17 +1,11 @@
 Ingested Last Period =
-VAR StartD = [Snap Period Start]
-VAR EndD   = [Snap Period End]
+VAR EndD = [Snap Period End]
 RETURN
-    CALCULATE ( [Ingested Records],
-        REMOVEFILTERS ( Date_Ingest ),
-        Date_Ingest[Date] > StartD,
-        Date_Ingest[Date] <= EndD )
-
-Matched Last Period =
-VAR StartD = [Snap Period Start]
-VAR EndD   = [Snap Period End]
-RETURN
-    CALCULATE ( [Matched (Ingest Axis)],
-        REMOVEFILTERS ( Date_Ingest ),
-        Date_Ingest[Date] > StartD,
-        Date_Ingest[Date] <= EndD )
+    SWITCH ( [Grain Sel],
+        0, CALCULATE ( [Ingested Records], REMOVEFILTERS ( Date_Ingest ),
+                       Date_Ingest[SnapWeekEnd] = EndD ),
+        1, CALCULATE ( [Ingested Records], REMOVEFILTERS ( Date_Ingest ),
+                       Date_Ingest[YearMonth] = FORMAT ( EndD, "yyyy-MM" ) ),
+        2, CALCULATE ( [Ingested Records], REMOVEFILTERS ( Date_Ingest ),
+                       Date_Ingest[Year] = YEAR ( EndD ) )
+    )
