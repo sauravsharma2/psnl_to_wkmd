@@ -1,14 +1,30 @@
-Added Last Month (Snap) =
+Step 1: Period ke measures
+Snap Period End =
 VAR LastW = MAX ( Snap_W[SnapshotDate] )
 VAR LastM = MAX ( Snap_M[SnapshotDate] )
+RETURN SWITCH ( [Grain Sel], 1, MAX ( LastW, LastM ), LastW )
+Snap Period Start =
+VAR LastW = MAX ( Snap_W[SnapshotDate] )
+VAR LastM = MAX ( Snap_M[SnapshotDate] )
+VAR PrevW = CALCULATE ( MAX ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < LastW )
 VAR PrevM = CALCULATE ( MAX ( Snap_M[SnapshotDate] ), Snap_M[SnapshotDate] < LastM )
-VAR MTot  = CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = LastM )
-VAR Cur =
-    IF ( LastW > LastM,
-         CALCULATE ( SUM ( Snap_W[Records] ), Snap_W[SnapshotDate] = LastW ),
-         MTot )
-VAR Prev =
-    IF ( LastW > LastM,
-         MTot,
-         CALCULATE ( SUM ( Snap_M[Records] ), Snap_M[SnapshotDate] = PrevM ) )
-RETURN IF ( NOT ISBLANK ( Prev ), Cur - Prev )
+RETURN
+    SWITCH ( [Grain Sel],
+        0, PrevW,
+        1, IF ( LastW > LastM, LastM, PrevM ),
+        2, DATE ( YEAR ( [Snap Period End] ), 1, 1 ) - 1
+    )
+Step 2: Card measures
+Ingested Last Period =
+CALCULATE ( [Ingested Records],
+    REMOVEFILTERS ( Date_Ingest ),
+    Date_Ingest[Date] > [Snap Period Start],
+    Date_Ingest[Date] <= [Snap Period End] )
+Matched Last Period =
+CALCULATE ( [Matched (Ingest Axis)],
+    REMOVEFILTERS ( Date_Ingest ),
+    Date_Ingest[Date] > [Snap Period Start],
+    Date_Ingest[Date] <= [Snap Period End] )
+Ingested Title = SWITCH ( [Grain Sel], 0, "Ingested Last Week", 1, "Ingested Last Month", "Ingested YTD" )
+Matched Title  = SWITCH ( [Grain Sel], 0, "Matched Last Week",  1, "Matched Last Month",  "Matched YTD" )
+Ingested Title aur Matched Title ko do alag measures banana hai.
