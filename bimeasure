@@ -1,18 +1,37 @@
-Ingested Last Period =
-VAR StartD = [Snap Period Start]
-VAR EndD   = [Snap Period End]
+SnapWeekEnd =
+VAR d         = Date_Ingest[Date]
+VAR FirstSnap = MINX ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] )
+VAR NextSnap  =
+    MINX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] >= d ),
+           Snap_W[SnapshotDate] )
 RETURN
-    CALCULATE ( [Ingested Records],
-        REMOVEFILTERS ( Date_Ingest ),
-        Date_Ingest[Date] >= StartD,
-        Date_Ingest[Date] <  EndD )
+    SWITCH ( TRUE (),
+        d < FirstSnap,          d - WEEKDAY ( d, 2 ) + 1,   -- snapshots se pehle: normal week
+        NOT ISBLANK ( NextSnap ), NextSnap,                 -- agle snapshot ka bucket
+        d - WEEKDAY ( d, 2 ) + 8                            -- last snapshot ke baad: agla Monday (in progress)
+    )
 
-Matched Period (Snap) =
-VAR StartD = [Snap Period Start]
-VAR EndD   = [Snap Period End]
+
+
+
+Ingested (Snap Bucket) =
+VAR k    = MAX ( Date_Ingest[SnapWeekEnd] )
+VAR prev = MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ),
+                  Snap_W[SnapshotDate] )
 RETURN
-    CALCULATE ( [Total Matches],
-        REMOVEFILTERS ( DateTable ),
-        DateTable[Date] >= StartD,
-        DateTable[Date] <  EndD,
-        TREATAS ( VALUES ( Dim_Country[Country] ), CrossRef_Matches[Country] ) )
+    IF ( [Grain Sel] <> 0, [Ingested Records],
+        IF ( NOT ISBLANK ( prev ),
+            CALCULATE ( [Ingested Records], REMOVEFILTERS ( Date_Ingest ),
+                        Date_Ingest[Date] >= prev, Date_Ingest[Date] < k ) ) )
+
+
+
+Matched (Snap Bucket) =
+VAR k    = MAX ( Date_Ingest[SnapWeekEnd] )
+VAR prev = MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ),
+                  Snap_W[SnapshotDate] )
+RETURN
+    IF ( [Grain Sel] <> 0, [Matched (Ingest Axis)],
+        IF ( NOT ISBLANK ( prev ),
+            CALCULATE ( [Matched (Ingest Axis)], REMOVEFILTERS ( Date_Ingest ),
+                        Date_Ingest[Date] >= prev, Date_Ingest[Date] < k ) ) )
