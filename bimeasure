@@ -1,37 +1,31 @@
-SnapWeekEnd =
-VAR d         = Date_Ingest[Date]
-VAR FirstSnap = MINX ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] )
-VAR NextSnap  =
-    MINX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] >= d ),
-           Snap_W[SnapshotDate] )
+Prev Total Label =
+VAR d = [Snap Period Start]
+VAR tW = CALCULATE ( SUM ( Snap_W[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_W[SnapshotDate] = d )
+VAR tM = CALCULATE ( SUM ( Snap_M[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_M[SnapshotDate] = d )
+VAR t  = IF ( NOT ISBLANK ( tW ), tW, tM )
+RETURN IF ( NOT ISBLANK ( t ),
+    "Prev " & FORMAT ( d, "dd MMM" ) & ": " & FORMAT ( t / 1e6, "0.000" ) & "M" )
+
+
+
+
+VAR prev =
+    COALESCE (
+        MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ), Snap_W[SnapshotDate] ),
+        k - 7 )
+
+
+
+Show In Snap Chart =
+VAR d      = MAX ( Date_Ingest[Date] )
+VAR k      = MAX ( Date_Ingest[SnapWeekEnd] )
+VAR FirstW = CALCULATE ( MIN ( Snap_W[SnapshotDate] ), REMOVEFILTERS () )
+VAR LastW  = CALCULATE ( MAX ( Snap_W[SnapshotDate] ), REMOVEFILTERS () )
+VAR FirstM = CALCULATE ( MIN ( Snap_M[SnapshotDate] ), REMOVEFILTERS () )
 RETURN
-    SWITCH ( TRUE (),
-        d < FirstSnap,          d - WEEKDAY ( d, 2 ) + 1,   -- snapshots se pehle: normal week
-        NOT ISBLANK ( NextSnap ), NextSnap,                 -- agle snapshot ka bucket
-        d - WEEKDAY ( d, 2 ) + 8                            -- last snapshot ke baad: agla Monday (in progress)
-    )
+    SWITCH ( [Grain Sel],
+        0, IF ( k >= FirstW && k <= LastW, 1, 0 ),              -- sirf wahi weeks jinka snapshot bana hai
+        1, IF ( d >= EOMONTH ( FirstM, -1 ) + 1, 1, 0 ),
+        1 )
 
 
-
-
-Ingested (Snap Bucket) =
-VAR k    = MAX ( Date_Ingest[SnapWeekEnd] )
-VAR prev = MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ),
-                  Snap_W[SnapshotDate] )
-RETURN
-    IF ( [Grain Sel] <> 0, [Ingested Records],
-        IF ( NOT ISBLANK ( prev ),
-            CALCULATE ( [Ingested Records], REMOVEFILTERS ( Date_Ingest ),
-                        Date_Ingest[Date] >= prev, Date_Ingest[Date] < k ) ) )
-
-
-
-Matched (Snap Bucket) =
-VAR k    = MAX ( Date_Ingest[SnapWeekEnd] )
-VAR prev = MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ),
-                  Snap_W[SnapshotDate] )
-RETURN
-    IF ( [Grain Sel] <> 0, [Matched (Ingest Axis)],
-        IF ( NOT ISBLANK ( prev ),
-            CALCULATE ( [Matched (Ingest Axis)], REMOVEFILTERS ( Date_Ingest ),
-                        Date_Ingest[Date] >= prev, Date_Ingest[Date] < k ) ) )
