@@ -1,31 +1,6 @@
-Prev Total Label =
-VAR d = [Snap Period Start]
-VAR tW = CALCULATE ( SUM ( Snap_W[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_W[SnapshotDate] = d )
-VAR tM = CALCULATE ( SUM ( Snap_M[Records] ), REMOVEFILTERS ( Date_Ingest ), Snap_M[SnapshotDate] = d )
-VAR t  = IF ( NOT ISBLANK ( tW ), tW, tM )
-RETURN IF ( NOT ISBLANK ( t ),
-    "Prev " & FORMAT ( d, "dd MMM" ) & ": " & FORMAT ( t / 1e6, "0.000" ) & "M" )
-
-
-
-
-VAR prev =
-    COALESCE (
-        MAXX ( FILTER ( ALL ( Snap_W[SnapshotDate] ), Snap_W[SnapshotDate] < k ), Snap_W[SnapshotDate] ),
-        k - 7 )
-
-
-
-Show In Snap Chart =
-VAR d      = MAX ( Date_Ingest[Date] )
-VAR k      = MAX ( Date_Ingest[SnapWeekEnd] )
-VAR FirstW = CALCULATE ( MIN ( Snap_W[SnapshotDate] ), REMOVEFILTERS () )
-VAR LastW  = CALCULATE ( MAX ( Snap_W[SnapshotDate] ), REMOVEFILTERS () )
-VAR FirstM = CALCULATE ( MIN ( Snap_M[SnapshotDate] ), REMOVEFILTERS () )
-RETURN
-    SWITCH ( [Grain Sel],
-        0, IF ( k >= FirstW && k <= LastW, 1, 0 ),              -- sirf wahi weeks jinka snapshot bana hai
-        1, IF ( d >= EOMONTH ( FirstM, -1 ) + 1, 1, 0 ),
-        1 )
-
-
+SELECT LEFT(BvD_ID_number, 2) AS Country,
+       COUNT(DISTINCT BvD_ID_number) AS Records
+FROM prd_bronze_orbis.orbis.legal_info
+WHERE Information_provider = 'BvD ownership database'
+  AND BvD_ID_number LIKE '%*%'
+GROUP BY LEFT(BvD_ID_number, 2)
