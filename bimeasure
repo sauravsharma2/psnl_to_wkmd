@@ -1,6 +1,89 @@
-SELECT LEFT(BvD_ID_number, 2) AS Country,
-       COUNT(DISTINCT BvD_ID_number) AS Records
-FROM prd_bronze_orbis.orbis.legal_info
-WHERE Information_provider = 'BvD ownership database'
-  AND BvD_ID_number LIKE '%*%'
-GROUP BY LEFT(BvD_ID_number, 2)
+let
+    Source = DatabricksMultiCloud.Catalogs("dbc-25db401b-39a2.cloud.databricks.com", "/sql/1.0/warehouses/2d81cde05e292363",
+        [Catalog=null, Database=null, QueryTags=null, EnableAutomaticProxyDiscovery=null, Implementation="2.0", Protocol=null]),
+    prd_bronze_orbis_Database = Source{[Name="prd_bronze_orbis",Kind="Database"]}[Data],
+    Result = Value.NativeQuery(prd_bronze_orbis_Database,
+        "SELECT COALESCE(c.Country_ISO_code, '(null)') AS Country,
+                CASE WHEN l.BvD_ID_number LIKE '%*%' THEN 'Direct ID' ELSE 'IP Source' END AS IdType,
+                COUNT(*) AS Records
+         FROM prd_bronze_orbis.orbis.legal_info l
+         LEFT JOIN prd_bronze_orbis.orbis.contact_info c
+                ON c.BvD_ID_number = l.BvD_ID_number
+         WHERE l.Information_provider = 'BvD ownership database'
+         GROUP BY 1, 2",
+        null, [EnableFolding = true]),
+    Typed = Table.TransformColumnTypes(Result,
+        {{"Country", type text}, {"IdType", type text}, {"Records", Int64.Type}})
+in
+    Typed
+
+
+
+let
+    Source = DatabricksMultiCloud.Catalogs("dbc-25db401b-39a2.cloud.databricks.com", "/sql/1.0/warehouses/2d81cde05e292363",
+        [Catalog=null, Database=null, EnableAutomaticProxyDiscovery=null]),
+    prd_bronze_orbis_Database = Source{[Name="prd_bronze_orbis",Kind="Database"]}[Data],
+    Result = Value.NativeQuery(prd_bronze_orbis_Database,
+        "SELECT make_date(CAST(lu.Addition_of_company_in_Orbis_year AS INT),
+                          CAST(lu.Addition_of_company_in_Orbis_month AS INT), 1) AS Addition_Month,
+                COALESCE(c.Country_ISO_code, '(null)') AS Country,
+                CASE WHEN l.BvD_ID_number LIKE '%*%' THEN 'Direct ID' ELSE 'IP Source' END AS IdType,
+                COUNT(*) AS Records
+         FROM prd_bronze_orbis.orbis.legal_info l
+         JOIN prd_bronze_orbis.orbis.last_updates lu
+              ON l.BvD_ID_number = lu.BvD_ID_number
+         LEFT JOIN prd_bronze_orbis.orbis.contact_info c
+              ON l.BvD_ID_number = c.BvD_ID_number
+         WHERE l.Information_provider = 'BvD ownership database'
+           AND lu.Addition_of_company_in_Orbis_year IS NOT NULL
+         GROUP BY 1, 2, 3",
+        null, [EnableFolding = true]),
+    Typed = Table.TransformColumnTypes(Result,
+        {{"Addition_Month", type date}, {"Country", type text}, {"IdType", type text}, {"Records", Int64.Type}})
+in
+    Typed
+
+
+
+let
+    Source = DatabricksMultiCloud.Catalogs("dbc-25db401b-39a2.cloud.databricks.com", "/sql/1.0/warehouses/2d81cde05e292363",
+        [Catalog=null, Database=null, QueryTags=null, EnableAutomaticProxyDiscovery=null, Implementation="2.0", Protocol=null]),
+    prd_bronze_orbis_Database = Source{[Name="prd_bronze_orbis",Kind="Database"]}[Data],
+    Result = Value.NativeQuery(prd_bronze_orbis_Database,
+        "SELECT COALESCE(c.Country_ISO_code, '(null)') AS Country,
+                'Direct ID' AS IdType,
+                COUNT(*) AS Records
+         FROM prd_bronze_orbis.orbis.legal_info l
+         LEFT JOIN prd_bronze_orbis.orbis.contact_info c
+                ON c.BvD_ID_number = l.BvD_ID_number
+         WHERE l.Information_provider = 'BvD ownership database'
+           AND l.BvD_ID_number LIKE '%*%'
+         GROUP BY 1",
+        null, [EnableFolding = true]),
+    Typed = Table.TransformColumnTypes(Result,
+        {{"Country", type text}, {"IdType", type text}, {"Records", Int64.Type}})
+in
+    Typed
+
+
+
+
+let
+    Source = DatabricksMultiCloud.Catalogs("dbc-25db401b-39a2.cloud.databricks.com", "/sql/1.0/warehouses/2d81cde05e292363",
+        [Catalog=null, Database=null, QueryTags=null, EnableAutomaticProxyDiscovery=null, Implementation="2.0", Protocol=null]),
+    prd_bronze_orbis_Database = Source{[Name="prd_bronze_orbis",Kind="Database"]}[Data],
+    Result = Value.NativeQuery(prd_bronze_orbis_Database,
+        "SELECT COALESCE(c.Country_ISO_code, '(null)') AS Country,
+                'IP Source' AS IdType,
+                COUNT(*) AS Records
+         FROM prd_bronze_orbis.orbis.legal_info l
+         LEFT JOIN prd_bronze_orbis.orbis.contact_info c
+                ON c.BvD_ID_number = l.BvD_ID_number
+         WHERE l.Information_provider = 'BvD ownership database'
+           AND l.BvD_ID_number NOT LIKE '%*%'
+         GROUP BY 1",
+        null, [EnableFolding = true]),
+    Typed = Table.TransformColumnTypes(Result,
+        {{"Country", type text}, {"IdType", type text}, {"Records", Int64.Type}})
+in
+    Typed
